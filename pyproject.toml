@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backstamp"
+dynamic = ["version"]
+description = "Record how a figure was made inside the figure file itself: commit, calling function, parameters."
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Joschua Geuter" }]
+requires-python = ">=3.9"
+dependencies = ["matplotlib", "pypdf>=3"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: Matplotlib",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/Joschua21/backstamp"
+
+[tool.setuptools.dynamic]
+version = { attr = "backstamp.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
