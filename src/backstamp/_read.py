@@ -54,7 +54,8 @@ class Record:
     - ``status``: ``"ok"``, ``"unstamped"`` (a PDF without a backstamp record),
       ``"unreadable"`` (not a PDF pypdf can open) or ``"missing"``.
     - A field the record does not hold is ``None``. ``commit`` is the bare hash; ``dirty``
-      says the code had uncommitted changes, and ``diff_sha`` identifies them.
+      says the code had uncommitted changes, and ``diff_sha`` identifies those to tracked
+      files. Untracked files alone leave it ``None``.
     - ``call``: ``function``, ``module``, ``file``, ``line``, ``chain``, ``params``.
     - ``versions``: ``package`` (the calling code's), ``python``, ``backstamp``.
     - ``cut``: what was cut to fit the size limit, e.g. ``params.trials``. Those values are

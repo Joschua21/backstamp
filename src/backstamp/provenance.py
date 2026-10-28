@@ -139,7 +139,8 @@ def git_info(anchor) -> dict:
     """``commit``, ``branch``, ``repo`` and, when dirty, ``diff_sha`` of the repo holding ``anchor``.
 
     - ``diff_sha`` hashes ``git diff HEAD``, so dirty figures can be matched to one
-      working-tree state. Untracked files are not in it.
+      working-tree state. Untracked files are not in it: a tree dirty from untracked
+      files alone has no ``diff_sha``.
     - ``repo`` is ``origin``'s URL without credentials; ``branch`` is ``None`` on a
       detached HEAD. Outside a repo the dict is empty.
     """
@@ -155,7 +156,7 @@ def git_info(anchor) -> dict:
     }
     if commit.endswith("-dirty"):
         diff = _git(["diff", "HEAD", "--no-color", "--no-ext-diff"], cwd, text=False)
-        if diff is not None:
+        if diff:
             info["diff_sha"] = hashlib.sha256(diff).hexdigest()[:12]
     return info
 

@@ -289,6 +289,9 @@ def test_git_info_records_branch_repo_and_a_hash_of_the_diff():
         assert info == {"commit": info["commit"], "branch": "topic",
                         "repo": "https://example.com/lab/repo.git"}  # clean: no diff_sha
 
+        (root / "new.txt").write_text("untracked")  # dirty, but no diff to hash
+        assert git_info(root) == {**info, "commit": info["commit"] + "-dirty"}
+
         (root / "a.txt").write_text("two")
         first = git_info(root)["diff_sha"]
         (root / "a.txt").write_text("three")
@@ -360,7 +363,7 @@ def test_provenance_anchors_on_the_caller_not_on_the_library():
         exec(compile(module.read_text(), str(module), "exec"), namespace)
         record = namespace["plot"]()
         assert record["commit"] == git_commit(root)  # dirty: plots.py is untracked
-        assert record["commit"].endswith("-dirty") and "diff_sha" in record
+        assert record["commit"].endswith("-dirty") and "diff_sha" not in record
 
 
 # --- inputs ---------------------------------------------------------------

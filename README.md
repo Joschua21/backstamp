@@ -34,8 +34,8 @@ describes the function that calls it.
 ## What the record holds
 
 - the commit of the repository the calling code lives in, marked `-dirty` when it has
-  uncommitted changes, with a hash of the diff; the branch, and the `origin` URL without
-  credentials
+  uncommitted changes or untracked files, with a hash of the diff to tracked files; the
+  branch, and the `origin` URL without credentials
 - the installed version of the calling package, the Python version and the backstamp
   version
 - the function that called `save`: its module, file, line, and the functions enclosing it
@@ -239,7 +239,8 @@ rec.to_dict()           # every field, as JSON-safe data
 | `"missing"` | not there |
 
 - `commit` is the hash alone. `dirty` says the code had uncommitted changes, and
-  `diff_sha` identifies them.
+  `diff_sha` identifies the changes to tracked files. Untracked files alone leave it
+  `None`.
 - The other fields are `branch`, `repo`, `created`, `title`, and `versions` (`package`,
   `python`, `backstamp`). A field the record does not hold is `None`.
 - `cut` names the values cut to fit the size limit, such as `params.trials`.
