@@ -322,7 +322,9 @@ def capture_call(*, skip_modules=()) -> dict | None:
     Returns ``function``, ``module``, ``file``, ``lineno``, ``chain``, ``args`` and ``path``.
 
     - ``chain``: up to `MAX_CHAIN` function names, nearest first. ``function`` is often a
-      local ``_save_fig`` closure; ``chain`` keeps the analysis around it.
+      local ``_save_fig`` closure; ``chain`` keeps the analysis around it. It ends at the
+      first ``<module>``: the frames above a script's, cell's or module's top level are
+      whatever ran it, such as IPython.
     - ``args``: every parameter's current value, unconverted.
     - ``path``: the file's full path, the git anchor. The record does not store it.
     """
@@ -341,13 +343,16 @@ def capture_call(*, skip_modules=()) -> dict | None:
         if not kept:
             return None
         entry = kept[0]
+        chain = [e.function for e in kept[:MAX_CHAIN]]
+        if "<module>" in chain:
+            chain = chain[: chain.index("<module>") + 1]
         return {
             "function": entry.function,
             "module": entry.frame.f_globals.get("__name__", ""),
             "file": Path(entry.filename).name,
             "path": entry.filename,
             "lineno": entry.lineno,
-            "chain": [e.function for e in kept[:MAX_CHAIN]],
+            "chain": chain,
             "args": _frame_args(entry.frame),
         }
     except Exception:

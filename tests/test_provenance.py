@@ -713,6 +713,13 @@ def test_chain_reaches_past_an_inner_save_closure():
     assert "test_chain_reaches_past_an_inner_save_closure" in record["chain"]
 
 
+def test_chain_ends_at_the_top_level_of_a_script_or_cell():
+    """Above ``<module>`` are the frames of whatever ran the code: IPython, runpy, this test."""
+    namespace = {"__name__": "__main__", "provenance": provenance}
+    exec("def plot():\n    return provenance()\nrecord = plot()\n", namespace)
+    assert namespace["record"]["chain"] == ["plot", "<module>"]
+
+
 def test_chain_survives_the_pdf_round_trip():
     with tempfile.TemporaryDirectory() as tmp:
         def analysis():
