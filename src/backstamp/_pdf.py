@@ -1,17 +1,14 @@
-"""The record in a PDF's info dictionary: written by `metadata`, read by `read_figure_metadata`.
+"""The record in a PDF's info dictionary, as `metadata` writes it; `backstamp.read` reads it.
 
 - matplotlib keeps only the standard info keys (``Title``, ``Subject``, ``Creator``, ...)
   and warns on any other. The record goes into ``Subject`` as JSON, with a one-line
   summary in ``Title``, the field a PDF viewer shows.
-- Reading uses pypdf, with a standard-library parser for files pypdf cannot open:
-  matplotlib writes the info dictionary uncompressed.
 """
 from __future__ import annotations
 
 import json
 import re
 from datetime import datetime
-from pathlib import Path
 
 from .provenance import (
     _options, _warn, capture_call, check_inputs, inputs_record, is_summary,
@@ -228,92 +225,7 @@ def filter_metadata(metadata: dict) -> dict:
     return {k: v for k, v in (metadata or {}).items() if k in _ALLOWED}
 
 
-# --- reading back ---------------------------------------------------------
-
-
-def read_figure_metadata(path) -> dict:
-    """A saved figure's record, plus its ``_title`` and ``_creator``.
-
-    - ``{}`` for a PDF without a record, an unreadable file or a missing one; never raises.
-      matplotlib stamps every PDF with its own ``Creator``, so ``{}`` keeps meaning "no
-      record here".
-    """
-    path = Path(path)
-    if not path.exists():
-        return {}
-    info = _read_info_pypdf(path)
-    if info is None:
-        info = _read_info_stdlib(path)
-
-    subject = (info or {}).get("Subject")
-    if not subject:
-        return {}
-
-    out: dict = {}
-    try:
-        parsed = json.loads(subject)
-    except (ValueError, TypeError):
-        parsed = None
-    if isinstance(parsed, dict):
-        out.update(parsed)
-    else:
-        out["_subject"] = subject
-    if info.get("Title"):
-        out["_title"] = info["Title"]
-    if info.get("Creator"):
-        out["_creator"] = info["Creator"]
-    return out
-
-
-def _read_info_pypdf(path: Path) -> dict | None:
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        return None
-    try:
-        meta = PdfReader(str(path)).metadata or {}
-        return {str(k).lstrip("/"): str(v) for k, v in meta.items()}
-    except Exception:
-        return None
-
-
-# `/Subject (....)` where the closing paren is not escaped. matplotlib writes the info
-# dictionary uncompressed, so this finds it without a PDF parser.
-_ENTRY_RE = r"/{key}\s*\((.*?)(?<!\\)\)"
-
-
-def _read_info_stdlib(path: Path) -> dict:
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return {}
-    info = {}
-    for key in ("Title", "Subject", "Creator"):
-        match = re.search(_ENTRY_RE.format(key=key).encode(), raw, re.S)
-        if match:
-            info[key] = _unescape(match.group(1))
-    return info
-
-
-_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f"}
-
-
-def _unescape(value: bytes) -> str:
-    """Undo PDF literal-string escaping and decode.
-
-    - One left-to-right pass: replacing ``\\(`` before ``\\\\`` corrupts a literal
-      backslash before a paren.
-    - A string holding any non-ASCII character is UTF-16 behind a byte-order mark. The
-      record is ASCII, but other tools write such strings.
-    """
-    if value[:2] in (b"\xfe\xff", b"\xff\xfe"):
-        text = value.decode("utf-16", errors="replace")
-    else:
-        text = value.decode("utf-8", errors="replace")
-    return re.sub(r"\\(.)", lambda m: _ESCAPES.get(m.group(1), m.group(1)), text)
-
-
 __all__ = [
-    "metadata", "build_pdf_metadata", "read_figure_metadata", "summarize_inputs",
-    "filter_metadata", "range_ends", "MAX_BLOB", "MAX_TITLE",
+    "metadata", "build_pdf_metadata", "summarize_inputs", "filter_metadata", "range_ends",
+    "MAX_BLOB", "MAX_TITLE",
 ]

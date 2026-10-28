@@ -23,6 +23,9 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+backstamp = "backstamp._cli:main"
+
 [project.urls]
 Repository = "https://github.com/Joschua21/backstamp"
 

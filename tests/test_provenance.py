@@ -30,16 +30,14 @@ except ImportError:  # not a dependency; the pandas cases run where it is instal
 
 import backstamp  # noqa: E402
 from backstamp._pdf import (  # noqa: E402
-    MAX_BLOB, MAX_TITLE, _dump, build_pdf_metadata, filter_metadata, read_figure_metadata,
-    summarize_inputs,
+    MAX_BLOB, MAX_TITLE, _dump, build_pdf_metadata, filter_metadata, summarize_inputs,
 )
+from backstamp._read import read  # noqa: E402
 from backstamp._save import save  # noqa: E402
 from backstamp.provenance import (  # noqa: E402
     _strip_credentials, capture_call, configure, git_commit, git_info, package_version,
     provenance, record_value,
 )
-
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def _git_repo(root: Path):
@@ -477,14 +475,15 @@ def test_a_record_over_the_cap_warns_cuts_the_largest_and_still_saves():
 
     with tempfile.TemporaryDirectory() as tmp:
         path, caught = _caught(plot, list(range(10_000)), np.zeros(3), tmp)
-        got = read_figure_metadata(path)
+        got = read(path)
     assert len(caught) == 1, caught
     message = str(caught[0].message)
     assert "big.pdf" in message and "30,000" in message and "params['trials']" in message
     assert caught[0].filename == __file__
-    assert got["params"]["trials"].startswith("<cut, ")
-    assert "frame" not in got["params"]  # a data summary, dropped first
-    assert got["params"]["window"] == 50 and got["function"] == "plot"
+    params = got.call["params"]
+    assert params["trials"].startswith("<cut, ") and got.cut == ["params.trials"]
+    assert "frame" not in params  # a data summary, dropped first
+    assert params["window"] == 50 and got.call["function"] == "plot"
 
 
 def test_inputs_are_cut_after_parameters_and_the_code_fields_never():
@@ -520,12 +519,12 @@ def test_pdf_round_trip():
         plt.close(fig)
         assert path.exists() and path.name == "accuracy.pdf"
 
-        got = read_figure_metadata(path)
-        assert got["function"] == "test_pdf_round_trip"
-        assert got["file"] == "test_provenance.py"
-        assert got["inputs"] == {"subject": [40, 66], "date": [20251124, 20260203]}
-        assert got["_title"] == "accuracy sub-40,66 20251124-20260203"
-        assert got["schema"] == 1 and "created_at" in got
+        got = read(path)
+        assert got.call["function"] == "test_pdf_round_trip"
+        assert got.call["file"] == "test_provenance.py"
+        assert got.inputs == {"subject": [40, 66], "date": [20251124, 20260203]}
+        assert got.title == "accuracy sub-40,66 20251124-20260203"
+        assert got.schema == 1 and got.created
 
 
 def test_save_takes_a_figure_an_axes_or_a_seaborn_grid():
@@ -575,9 +574,9 @@ def test_explicit_provenance_overrides_introspection_and_gets_the_inputs():
         fig, ax = plt.subplots()
         path = save(fig, "x", fig_dir=tmp, inputs={"subject": 1}, provenance=explicit)
         plt.close(fig)
-        got = read_figure_metadata(path)
-    assert got["function"] == "the_real_plotter" and got["note"] == "explicit"
-    assert got["inputs"] == {"subject": 1}
+        got = read(path)
+    assert got.call["function"] == "the_real_plotter" and got.extra == {"note": "explicit"}
+    assert got.inputs == {"subject": 1}
     assert explicit == {"function": "the_real_plotter", "note": "explicit"}  # not mutated
 
 
@@ -601,12 +600,12 @@ def test_metadata_in_your_own_savefig_and_pdfpages():
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         _, caught = _caught(plot_accuracy, [40], out)
-        own = read_figure_metadata(out / "own.pdf")
-        pages = read_figure_metadata(out / "pages.pdf")
+        own = read(out / "own.pdf")
+        pages = read(out / "pages.pdf")
     assert not caught
-    assert own["function"] == "plot_accuracy" and own["inputs"] == {"subjids": [40]}
-    assert own["_title"] == "plot_accuracy subjids=40"
-    assert pages["function"] == "plot_accuracy" and pages["_title"] == "pages"
+    assert own.call["function"] == "plot_accuracy" and own.inputs == {"subjids": [40]}
+    assert own.title == "plot_accuracy subjids=40"
+    assert pages.call["function"] == "plot_accuracy" and pages.title == "pages"
 
 
 def test_filter_metadata_drops_keys_matplotlib_would_reject():
@@ -624,50 +623,17 @@ def test_saving_never_warns_about_infodict_keys():
         assert not [w for w in caught if "infodict" in str(w.message)]
 
 
-# --- reading --------------------------------------------------------------
+# --- round trips ----------------------------------------------------------
 
 
-def test_reading_a_provenance_free_or_missing_pdf_returns_empty():
-    """``{}`` must mean "no record", so ``if not read_figure_metadata(p)`` works."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fig, ax = plt.subplots()
-        bare = Path(tmp) / "bare.pdf"
-        fig.savefig(bare)
-        plt.close(fig)
-        assert read_figure_metadata(bare) == {}
-        assert read_figure_metadata(Path(tmp) / "nope.pdf") == {}
-        (Path(tmp) / "junk.pdf").write_bytes(b"not a pdf")
-        assert read_figure_metadata(Path(tmp) / "junk.pdf") == {}
-
-
-def test_reads_an_unversioned_record():
-    """``fixtures/unversioned.pdf``, saved by hypnose-helpers 83dfc95: no ``schema``,
-    ``subjids`` and ``dates`` at the top level."""
-    from backstamp._pdf import _read_info_stdlib
-
-    path = FIXTURES / "unversioned.pdf"
-    got = read_figure_metadata(path)
-    assert "schema" not in got and "inputs" not in got
-    assert got["function"] == "plot_accuracy" and got["commit"] == "88e7495"
-    assert got["subjids"] == ["040", "066"] and got["dates"] == ["20251124", "20251130"]
-    assert got["params"] == {"subjids": [40, 66], "dates": ["20251124", "20251130"],
-                             "window": 50}
-    assert got["_title"] == "accuracy sub-040,066 20251124-20251130"
-    assert got["_creator"] == "hypnose"
-    assert json.loads(_read_info_stdlib(path)["Subject"])["subjids"] == ["040", "066"]
-
-
-def test_stdlib_reader_matches_on_awkward_characters():
-    """Both readers: pypdf through read_figure_metadata, and the stdlib fallback directly."""
-    from backstamp._pdf import _read_info_stdlib
-
+def test_round_trip_keeps_parens_and_backslashes():
+    """PDF literal strings escape both."""
     with tempfile.TemporaryDirectory() as tmp:
         fig, ax = plt.subplots()
         note = r"parens ( ) and \ backslash"
         path = save(fig, "x", fig_dir=tmp, provenance={"function": "f", "note": note})
         plt.close(fig)
-        assert json.loads(_read_info_stdlib(path)["Subject"])["note"] == note
-        assert read_figure_metadata(path)["note"] == note
+        assert read(path).extra["note"] == note
 
 
 def test_round_trip_keeps_long_and_non_ascii_arguments():
@@ -678,10 +644,10 @@ def test_round_trip_keeps_long_and_non_ascii_arguments():
             "params": record_value({"many": list(range(99)), "unicode": "µ ± σ °C"}),
         })
         plt.close(fig)
-        got = read_figure_metadata(path)
-        assert got["function"] == "f"
-        assert got["params"]["many"] == list(range(99))
-        assert got["params"]["unicode"] == "µ ± σ °C"
+        got = read(path)
+        assert got.call["function"] == "f"
+        assert got.call["params"]["many"] == list(range(99))
+        assert got.call["params"]["unicode"] == "µ ± σ °C"
 
 
 # --- wrappers and the chain -----------------------------------------------
@@ -730,7 +696,7 @@ def test_save_forwards_skip_modules():
         return path
 
     with tempfile.TemporaryDirectory() as tmp:
-        assert read_figure_metadata(real_plotter(tmp))["function"] == "real_plotter"
+        assert read(real_plotter(tmp)).call["function"] == "real_plotter"
 
 
 def test_chain_reaches_past_an_inner_save_closure():
@@ -757,8 +723,8 @@ def test_chain_survives_the_pdf_round_trip():
                 return path
             return _save_fig()
 
-        got = read_figure_metadata(analysis())
-        assert got["chain"][:2] == ["_save_fig", "analysis"]
+        got = read(analysis())
+        assert got.call["chain"][:2] == ["_save_fig", "analysis"]
 
 
 def main() -> int:

@@ -12,7 +12,7 @@ backstamp writes that record into the figure file when it is saved, and reads it
 pip install backstamp
 ```
 
-Python 3.9 or later. Installs matplotlib and pypdf.
+Python 3.9 or later. Installs matplotlib and pypdf, and the `backstamp` command.
 
 ## Save
 
@@ -115,7 +115,8 @@ Other text, such as names in an ordinary string parameter, is stored as it is.
 
 A record is at most 30,000 characters. A larger one still saves, with a warning naming the
 figure and the size. backstamp drops the data summaries first, then cuts parameters,
-largest first, then inputs, and lists what it cut. The code fields are never cut.
+largest first, then inputs, and lists what it cut. The code fields are never cut. Reading
+the figure back names the cut values too.
 
 ## File names
 
@@ -129,15 +130,121 @@ backstamp.save(fig, "accuracy", fig_dir="figures/", inputs={"subject": [40, 45]}
 
 ## Read
 
-```python
-backstamp.read_figure_metadata("figures/accuracy.pdf")
-# {"commit": "a1b2c3d", "function": "plot_accuracy",
-#  "inputs": {"subject": [40, 45], "date": [...]},
-#  "params": {"subjids": [40, 45], "dates": [...], "window": 50, "norm": 1.0}, ...}
+```
+$ backstamp show figures/accuracy.pdf
+figures/accuracy.pdf
+  title     accuracy sub-40,45 20251124-20260203
+  inputs    subject = [40, 45]
+            date    = ["20251124", "20260203"]
+  made by   lab.plots:plot_accuracy  (plots.py:212)
+  chain     plot_accuracy <- main
+  params    subjids = [40, 45]
+            dates   = ["20251124", "20260203"]
+            trials  = "<DataFrame 50x2>"
+            window  = 50
+            norm    = 1.0
+  commit    a1b2c3d-dirty  diff 3f2a9c1e0b7d  on main  https://github.com/me/lab.git
+  created   2026-10-05T14:02:11+01:00
+  versions  lab 0.3.0, python 3.12.13, backstamp 0.1.0
 ```
 
-Returns `{}` for a figure without a record, a file that is not a readable PDF, or a missing
-file.
+- With no path, `backstamp show` waits for one: drop a figure into the terminal window, or
+  paste its path, and press Enter. Several files dropped at once are read together. An
+  empty line or Ctrl-D quits.
+- It also takes folders, searched with their subfolders, and globs.
+- `--json` prints every field. `--reproduce` prints the commands that rebuild the figure.
+- `python -m backstamp` runs the same command.
+
+### Find figures
+
+`backstamp ls` lists the figures in a folder and its subfolders, one row each:
+
+```
+$ backstamp ls figures/
+name            function       commit         inputs                       created
+accuracy        plot_accuracy  a1b2c3d-dirty  sub-40,45 20251124-20260203  2026-10-05
+sub-40/latency  plot_latency   a1b2c3d        sub-40 20251124-20251130     2026-10-06
+
+$ backstamp ls figures/ --dirty --subject 40
+name      function       commit         inputs                       created
+accuracy  plot_accuracy  a1b2c3d-dirty  sub-40,45 20251124-20260203  2026-10-05
+```
+
+| Filter | Keeps figures |
+| --- | --- |
+| `--subject ID`, `--date DATE`, `--session ID` | with that value in the input of that name |
+| `--input KEY=VALUE` | with `VALUE` in the input `KEY` |
+| `--function NAME` | made by `NAME`, or inside a call to `NAME` |
+| `--commit SHA` | made at that commit; a prefix is enough |
+| `--dirty` | made with uncommitted changes |
+| `--unstamped` | without a record |
+
+- A figure must pass every filter given. Each can be repeated.
+- Values match as text, inside mappings too: under `subject`, a mapping's keys are subjects
+  and its values their dates.
+- Whole numbers match by value, so `--subject 40` finds `"040"`.
+- A date, `YYYYMMDD` or ISO, finds a stored range that holds it, and can be a range itself:
+  `--date 20251101-20251130`. A range in any other format matches its ends exactly.
+
+### Rebuild a figure
+
+```
+$ backstamp show --reproduce figures/accuracy.pdf
+# figures/accuracy.pdf
+# Not an exact rebuild:
+# - The code had uncommitted changes (diff 3f2a9c1e0b7d): the checkout is not the code that ran.
+# - The record holds a placeholder, not the value, for trials (<DataFrame 50x2>): pass the real values.
+
+git clone https://github.com/me/lab.git
+cd lab
+git checkout a1b2c3d
+
+# Then, in Python, with this checkout installed (e.g. pip install -e .):
+from lab.plots import plot_accuracy
+
+plot_accuracy(
+    subjids=[40, 45],
+    dates=['20251124', '20260203'],
+    trials=...,  # <DataFrame 50x2>
+    window=50,
+    norm=1.0,
+)
+```
+
+The commands check out the recorded commit and repeat the call with every parameter. Above
+them is what keeps them from rebuilding the figure exactly: uncommitted changes, a
+parameter stored as a summary or placeholder, a value cut to fit, a script run directly
+rather than imported, or a repository or commit the record does not name.
+
+### In Python
+
+```python
+rec = backstamp.read("figures/accuracy.pdf")
+rec.status              # "ok"
+rec.commit, rec.dirty   # "a1b2c3d", True
+rec.call["function"]    # "plot_accuracy"; also module, file, line, chain and params
+rec.inputs              # {"subject": [40, 45], "date": ["20251124", "20260203"]}
+print(rec)              # the block backstamp show prints
+print(rec.reproduce())
+rec.to_dict()           # every field, as JSON-safe data
+```
+
+`read` never raises. `rec.status` says what it found:
+
+| `status` | The file is |
+| --- | --- |
+| `"ok"` | a figure with a record |
+| `"unstamped"` | a PDF without a record, such as one another program saved |
+| `"unreadable"` | not a PDF |
+| `"missing"` | not there |
+
+- `commit` is the hash alone. `dirty` says the code had uncommitted changes, and
+  `diff_sha` identifies them.
+- The other fields are `branch`, `repo`, `created`, `title`, and `versions` (`package`,
+  `python`, `backstamp`). A field the record does not hold is `None`.
+- `cut` names the values cut to fit the size limit, such as `params.trials`.
+- `extra` holds any field passed in `save(provenance=...)` without an attribute of its own.
+- In Jupyter, a record displays as a table.
 
 ## Wrapping `save`
 
