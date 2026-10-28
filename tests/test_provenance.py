@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-"""Unit tests for `backstamp.provenance`, `backstamp.metadata` and `backstamp.save`.
+"""Tests for `backstamp.provenance`, `backstamp._pdf` and `backstamp._save`.
 
 Run directly (no pytest needed)::
 
     python tests/test_provenance.py
-
-The value summariser is where the work is: every argument any plotting function has ever
-been called with has to become small, JSON-safe text without raising. Most of the cases
-below are that.
 """
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
 import sys
 import tempfile
+import warnings
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -22,106 +21,246 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
 try:
     import pandas as pd  # noqa: E402
 except ImportError:  # not a dependency; the pandas cases run where it is installed
     pd = None
 
+import backstamp  # noqa: E402
+from backstamp._pdf import (  # noqa: E402
+    MAX_BLOB, MAX_TITLE, _dump, build_pdf_metadata, filter_metadata, read_figure_metadata,
+    summarize_inputs,
+)
+from backstamp._save import save  # noqa: E402
 from backstamp.provenance import (  # noqa: E402
-    capture_call, git_commit, provenance, summarize_value,
+    _strip_credentials, capture_call, configure, git_commit, git_info, package_version,
+    provenance, record_value,
 )
-from backstamp.metadata import (  # noqa: E402
-    MAX_BLOB, build_pdf_metadata, filter_metadata, read_figure_metadata, summarize_scope,
-)
-from backstamp.save import save  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-# --- the value summariser -------------------------------------------------
+def _git_repo(root: Path):
+    """A repo at ``root`` with one commit of ``a.txt``; returns a ``git`` runner."""
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, check=True)
+    run("init", "-q")
+    run("config", "user.email", "t@t")
+    run("config", "user.name", "t")
+    run("config", "commit.gpgsign", "false")
+    (root / "a.txt").write_text("one")
+    run("add", "-A")
+    run("commit", "-qm", "first")
+    return run
+
+
+def _caught(fn, *args, **kwargs):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fn(*args, **kwargs)
+    return result, [w for w in caught if "backstamp" in str(w.message)]
+
+
+# --- values ---------------------------------------------------------------
 
 
 def test_scalars_pass_through():
     for value in (None, True, False, 0, -3, 2.5, "short"):
-        assert summarize_value(value) == value, value
+        assert record_value(value) == value, value
 
 
-def test_long_strings_truncate():
-    out = summarize_value("x" * 500)
-    assert len(out) <= 80 and out.endswith("...")
+def test_strings_and_containers_are_kept_in_full():
+    assert record_value("x" * 500) == "x" * 500
+    assert record_value(list(range(50))) == list(range(50))
+    assert record_value({f"k{i}": i for i in range(50)}) == {f"k{i}": i for i in range(50)}
+    assert record_value({"a": [1, {"b": "x" * 500}]}) == {"a": [1, {"b": "x" * 500}]}
+    assert record_value((1, 2)) == [1, 2]
+    assert record_value({3, 1, 2}) == [1, 2, 3]
+    assert record_value({1: "a", (1, 2): "b"}) == {"1": "a", "[1, 2]": "b"}
 
 
 def test_non_finite_floats_become_strings():
     """NaN and inf are not valid JSON; json.dumps emits them anyway, so catch them here."""
     for value in (float("nan"), float("inf"), float("-inf")):
-        assert isinstance(summarize_value(value), str)
-    assert json.loads(json.dumps({"v": summarize_value(float("nan"))}))
+        assert isinstance(record_value(value), str)
+    assert json.loads(json.dumps({"v": record_value(float("nan"))}))
 
 
-def test_containers_truncate_and_report_the_remainder():
-    out = summarize_value(list(range(50)))
-    assert len(out) == 11 and out[-1] == "...+40 more"
-    out = summarize_value({f"k{i}": i for i in range(50)})
-    assert len(out) == 11 and out["..."] == "+40 more"
-    assert summarize_value((1, 2)) == [1, 2]
-    assert sorted(summarize_value({3, 1, 2})) == [1, 2, 3]
+def test_numpy_scalars_become_plain_numbers_and_dates_iso_text():
+    for value, expected in ((np.int64(3), 3), (np.float32(1.5), 1.5), (np.bool_(True), True)):
+        out = record_value(value)
+        assert out == expected and type(out) is type(expected), (value, out)
+    assert record_value(date(2025, 11, 24)) == "2025-11-24"
+    assert record_value(datetime(2025, 11, 24, 9, 30)) == "2025-11-24T09:30:00"
 
 
-def test_nested_containers_are_summarised_recursively():
-    assert summarize_value({"a": [1, {"b": "x" * 500}]})["a"][1]["b"].endswith("...")
-
-
-def test_scientific_types_become_descriptors():
-    import numpy as np
-
-    assert summarize_value(np.zeros((100, 3))) == "<ndarray (100, 3) float64>"
+def test_data_objects_become_type_and_shape():
+    assert record_value(np.zeros((100, 3))) == "<ndarray (100, 3) float64>"
     fig, ax = plt.subplots()
-    assert summarize_value(ax).startswith("<Axes")
+    assert record_value(ax).startswith("<Axes")
     plt.close(fig)
+
+    class Table:
+        shape = (5, 2)
+
+    assert record_value(Table()) == "<Table (5, 2)>"
     if pd is not None:
-        assert summarize_value(pd.DataFrame({"a": [1, 2], "b": [3, 4]})) == "<DataFrame 2x2>"
-        assert summarize_value(pd.Series([1, 2, 3])).startswith("<Series 3 ")
+        assert record_value(pd.DataFrame({"a": [1, 2], "b": [3, 4]})) == "<DataFrame 2x2>"
+        assert record_value(pd.Series([1, 2, 3])).startswith("<Series 3 ")
 
 
-def test_unknown_objects_become_type_names():
+def test_unknown_objects_become_type_names_and_cycles_stop():
     class Widget:
         pass
 
-    assert summarize_value(Widget()) == "<Widget>"
-    assert summarize_value(Path("/tmp/x")) == "/tmp/x"
+    assert record_value(Widget()) == "<Widget>"
+    loop = [1]
+    loop.append(loop)
+    assert record_value(loop) == [1, "<cycle>"]
 
 
-def test_summariser_output_is_json_serialisable():
-    import numpy as np
-
-    payload = {"arr": np.zeros(3), "nested": [{"x": None}],
-               "big": list(range(100)), "nan": float("nan")}
+def test_values_are_json_serialisable():
+    payload = {"arr": np.zeros(3), "nested": [{"x": None}], "big": list(range(100)),
+               "nan": float("nan"), "n": np.int64(2), "when": date(2026, 1, 1)}
     if pd is not None:
         payload["df"] = pd.DataFrame({"a": [1]})
-    json.dumps(summarize_value(payload))  # must not raise
+    json.dumps(record_value(payload))  # must not raise
+
+
+# --- paths and private data -----------------------------------------------
+
+
+_PATH_ARGS = {
+    "path": Path("/Users/me/data/sub-040/trials.parquet"),
+    "text": "/Users/me/data/x.csv",
+    "home": "~/data/y.csv",
+    "windows": "C:\\Users\\me\\z.csv",
+    "relative_text": "figures/",
+    "relative_path": Path("figures/a.pdf"),
+    "label": "A/B",
+}
+
+
+def _plot_with_paths(path, text, home, windows, relative_text, relative_path, label, *,
+                     _paths=None):
+    return provenance(paths=_paths, inputs=["path", "text"])
+
+
+def test_paths_are_stored_by_name_by_default():
+    record = _plot_with_paths(**_PATH_ARGS)
+    assert record["params"] == {
+        "path": "trials.parquet", "text": "x.csv", "home": "y.csv", "windows": "z.csv",
+        "relative_text": "figures/", "relative_path": "a.pdf", "label": "A/B",
+        "_paths": None,
+    }
+    assert record["inputs"] == {"path": "trials.parquet", "text": "x.csv"}
+
+
+def test_paths_full_and_hide():
+    full = _plot_with_paths(**_PATH_ARGS, _paths="full")
+    assert full["params"]["path"] == str(_PATH_ARGS["path"])
+    assert full["params"]["windows"] == "C:\\Users\\me\\z.csv"
+    assert full["params"]["home"] == "~/data/y.csv"
+
+    hidden = _plot_with_paths(**_PATH_ARGS, _paths="hide")["params"]
+    for name in ("path", "text", "home", "windows", "relative_path"):
+        assert hidden[name] == "<path>", name
+    assert hidden["relative_text"] == "figures/" and hidden["label"] == "A/B"
+
+
+def test_paths_inside_containers_are_reduced_too():
+    assert record_value({"files": [Path("/a/b/c.csv"), "/d/e.csv"]}) == {
+        "files": ["c.csv", "e.csv"]}
+
+
+def test_redact_lists_the_name_without_the_value():
+    def plot(subjids, token):
+        return provenance(redact=["token"], inputs={"subject": subjids, "token": token})
+
+    record = plot([40], "s3cret")
+    assert record["params"] == {"subjids": [40], "token": "<redacted>"}
+    assert record["inputs"] == {"subject": [40], "token": "<redacted>"}
+    assert "s3cret" not in json.dumps(record)
+
+
+def test_configure_sets_defaults_a_call_overrides_paths_and_adds_to_redact():
+    def plot(data, token, user):
+        return provenance(), provenance(paths="full", redact=["user"]), provenance(redact=[])
+
+    configure(paths="hide", redact=["token"])
+    try:
+        configured, per_call, empty = plot(Path("/x/y.csv"), "s3cret", "me")
+    finally:
+        configure(paths="name", redact=[])
+    assert configured["params"] == {"data": "<path>", "token": "<redacted>", "user": "me"}
+    assert per_call["params"] == {"data": "/x/y.csv", "token": "<redacted>",
+                                  "user": "<redacted>"}
+    assert empty["params"]["token"] == "<redacted>"  # a call cannot lift a configured name
+
+
+def test_bad_settings_raise():
+    for call in (lambda: configure(paths="short"), lambda: provenance(paths="nope")):
+        try:
+            call()
+        except ValueError as e:
+            assert "name" in str(e)
+        else:
+            raise AssertionError("no ValueError")
+    try:
+        configure(redact=5)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("no TypeError")
 
 
 # --- capturing the call ---------------------------------------------------
 
 
-def _plotter(data, subjids, *, window=30, **kwargs):
-    return capture_call()
+def _plotter(data, subjids, *more, window=30, **kwargs):
+    return provenance()
 
 
-def test_capture_records_function_args_and_kwargs():
-    import numpy as np
+def test_the_record_holds_every_parameter():
+    record = _plotter(np.zeros((2, 1)), [40, 45], "extra", window=7, color="red")
+    assert record["function"] == "_plotter"
+    assert record["file"] == "test_provenance.py"
+    assert isinstance(record["lineno"], int)
+    assert record["params"] == {
+        "data": "<ndarray (2, 1) float64>", "subjids": [40, 45], "more": ["extra"],
+        "window": 7, "color": "red",  # color arrived through **kwargs
+    }
 
-    got = _plotter(np.zeros((2, 1)), [40, 45], window=7, color="red")
-    assert got["function"] == "_plotter"
-    assert got["file"] == "test_provenance.py"
-    assert isinstance(got["lineno"], int)
-    assert got["params"]["data"] == "<ndarray (2, 1) float64>"
-    assert got["params"]["subjids"] == [40, 45]
-    assert got["params"]["window"] == 7
-    assert got["params"]["color"] == "red"  # arrived via **kwargs
+
+def test_long_lists_nested_dicts_and_many_parameters_are_stored_in_full():
+    config = {"a": {"b": {"c": list(range(30))}}, **{f"k{i}": i for i in range(40)}}
+
+    def plot(trials, config, p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, p9=9, p10=10,
+             p11=11, p12=12, p13=13, p14=14, p15=15, p16=16):
+        return provenance()
+
+    params = plot(list(range(500)), config)["params"]
+    assert params["trials"] == list(range(500))
+    assert params["config"] == config
+    assert len(params) == 18 and params["p16"] == 16
+
+
+def test_a_variable_passed_in_is_recorded_by_its_contents():
+    ab_data = [63, 64, 65, 66]
+
+    def plot(subjids):
+        return provenance(inputs=["subjids"])
+
+    record = plot(subjids=ab_data)
+    assert record["params"]["subjids"] == [63, 64, 65, 66]
+    assert record["inputs"] == {"subjids": [63, 64, 65, 66]}
+    assert "ab_data" not in json.dumps(record)
 
 
 def test_capture_skips_the_saving_machinery():
-    """The first frame must never be provenance.py itself."""
+    """The first frame must never be backstamp itself."""
     assert capture_call()["function"] == "test_capture_skips_the_saving_machinery"
 
 
@@ -132,18 +271,9 @@ def test_git_commit_reports_dirty_and_tolerates_a_non_repo():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         assert git_commit(root) is None  # not a repo -> None, never an exception
-
-        run = lambda *a: subprocess.run(a, cwd=root, capture_output=True)  # noqa: E731
-        run("git", "init", "-q")
-        run("git", "config", "user.email", "t@t")
-        run("git", "config", "user.name", "t")
-        (root / "a.txt").write_text("one")
-        run("git", "add", "-A")
-        run("git", "commit", "-qm", "first")
-
+        _git_repo(root)
         clean = git_commit(root)
         assert clean and not clean.endswith("-dirty")
-
         (root / "a.txt").write_text("two")
         assert git_commit(root) == f"{clean}-dirty"
 
@@ -151,30 +281,42 @@ def test_git_commit_reports_dirty_and_tolerates_a_non_repo():
     assert git_commit(Path("/nonexistent/xyz")) is None
 
 
-def test_provenance_anchors_on_the_caller_not_on_the_library():
-    """The whole point: the commit must describe the code that ran.
+def test_git_info_records_branch_repo_and_a_hash_of_the_diff():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = _git_repo(root)
+        run("remote", "add", "origin", "https://user:token@example.com/lab/repo.git")
+        run("checkout", "-qb", "topic")
+        info = git_info(root)
+        assert info == {"commit": info["commit"], "branch": "topic",
+                        "repo": "https://example.com/lab/repo.git"}  # clean: no diff_sha
 
-    backstamp is installed as a library, so anchoring on its own __file__ would stamp
-    every figure from every repo with the backstamp commit.
-    """
-    record = provenance()
-    assert record["function"] == "test_provenance_anchors_on_the_caller_not_on_the_library"
-    assert record["file"] == "test_provenance.py"
-    assert "created_at" in record
-    json.dumps(record)
+        (root / "a.txt").write_text("two")
+        first = git_info(root)["diff_sha"]
+        (root / "a.txt").write_text("three")
+        assert git_info(root)["diff_sha"] != first
+        (root / "a.txt").write_text("two")
+        assert git_info(root)["diff_sha"] == first
+
+        run("checkout", "-q", "--detach")
+        assert git_info(root)["branch"] is None
+    assert git_info(None) == {}
 
 
-# --- the PDF ---------------------------------------------------------------
+def test_credentials_are_stripped_and_a_local_remote_is_a_path():
+    assert _strip_credentials("https://x:y@github.com/a/b.git") == "https://github.com/a/b.git"
+    assert _strip_credentials("https://tok@en@github.com/a/b") == "https://github.com/a/b"
+    assert _strip_credentials("git@github.com:a/b.git") == "git@github.com:a/b.git"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = _git_repo(root)
+        run("remote", "add", "origin", "/Users/me/repos/lab.git")
+        assert provenance(anchor=root, call={"module": "x"})["repo"] == "lab.git"
 
 
 def test_package_version_resolves_a_renamed_distribution():
-    """Import package and distribution names often differ.
-
-    `hypnose_behavior` ships from `hypnose-behavior-analysis`, so swapping underscores
-    for hyphens finds nothing; only packages_distributions() maps it, from Python 3.10.
-    """
-    from backstamp.provenance import package_version
-
+    """Import and distribution names often differ; only packages_distributions() maps
+    them, from Python 3.10."""
     with tempfile.TemporaryDirectory() as tmp:
         info = Path(tmp) / "renamed_dist-1.2.3.dist-info"
         info.mkdir()
@@ -195,11 +337,276 @@ def test_package_version_resolves_a_renamed_distribution():
     assert package_version(None) is None
 
 
-def test_summarize_scope():
-    assert summarize_scope("accuracy", 66, 20260709) == "accuracy sub-066 20260709"
-    assert summarize_scope("accuracy", [40, 45, 66], ["20251124", "20260203"]) == (
-        "accuracy sub-040,045,066 20251124-20260203")
-    assert summarize_scope("plain") == "plain"
+# --- the record -----------------------------------------------------------
+
+
+def test_the_record_has_a_schema_and_versions_and_no_full_path():
+    record = provenance()
+    assert record["function"] == "test_the_record_has_a_schema_and_versions_and_no_full_path"
+    assert record["schema"] == 1
+    assert record["python"] == platform.python_version()
+    assert record["backstamp"] == backstamp.__version__
+    assert "path" not in record and "created_at" in record
+    json.dumps(record)
+
+
+def test_provenance_anchors_on_the_caller_not_on_the_library():
+    """The commit must describe the code that ran, so the anchor is the caller's file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _git_repo(root)
+        module = root / "plots.py"
+        module.write_text("from backstamp.provenance import provenance\n"
+                          "def plot():\n    return provenance()\n")
+        namespace = {"__name__": "plots"}
+        exec(compile(module.read_text(), str(module), "exec"), namespace)
+        record = namespace["plot"]()
+        assert record["commit"] == git_commit(root)  # dirty: plots.py is untracked
+        assert record["commit"].endswith("-dirty") and "diff_sha" in record
+
+
+# --- inputs ---------------------------------------------------------------
+
+
+def test_inputs_numeric_and_text_ids_and_text_dates_are_stored_as_given():
+    record = provenance(inputs={"subject": [40, "mouseA"], "date": ["20261002", "03oct2026"]})
+    assert record["inputs"] == {"subject": [40, "mouseA"], "date": ["20261002", "03oct2026"]}
+
+
+def test_inputs_ranges():
+    """A tuple of two is a range, stored ``start/end``; a list of two is two values."""
+    record = provenance(inputs={
+        "date": ("20251124", "20251130"),
+        "days": (20251124, 20251130),
+        "text": "20251124-20251130",
+        "pair": ["20251124", "20251130"],
+        "triple": (1, 2, 3),
+    })
+    assert record["inputs"] == {
+        "date": "20251124/20251130", "days": "20251124/20251130", "text": "20251124-20251130",
+        "pair": ["20251124", "20251130"], "triple": [1, 2, 3],
+    }
+
+
+def test_inputs_mappings():
+    """Mapping keys become text in JSON: 40 reads back as "40"."""
+    record = provenance(inputs={
+        "subject": {40: ("20251124", "20251130"), 41: ["20260101", "20260115"],
+                    "mouseA": {"session": [1, 2]}},
+    })
+    assert record["inputs"] == {"subject": {
+        "40": "20251124/20251130", "41": ["20260101", "20260115"],
+        "mouseA": {"session": [1, 2]},
+    }}
+
+
+def test_inputs_named_parameters_are_copied_in_full():
+    def plot(subjids, dates, window=50):
+        return provenance(inputs=["subjids", "dates"])
+
+    record = plot(list(range(40, 80)), ("20251124", "20251130"))
+    assert record["inputs"] == {"subjids": list(range(40, 80)), "dates": "20251124/20251130"}
+
+
+def test_an_unknown_input_name_warns_at_the_caller():
+    def plot(subjids):
+        return provenance(inputs=["subjids", "subjid"])
+
+    record, caught = _caught(plot, [40])
+    assert record["inputs"] == {"subjids": [40]}
+    assert len(caught) == 1, caught
+    assert "plot()" in str(caught[0].message) and "'subjid'" in str(caught[0].message)
+    assert caught[0].filename == __file__
+
+
+def test_inputs_of_the_wrong_type_raise():
+    for bad in (40, [1, 2], {"a"}):
+        try:
+            provenance(inputs=bad)
+        except TypeError as e:
+            assert "inputs" in str(e)
+        else:
+            raise AssertionError(f"no TypeError for {bad!r}")
+
+
+# --- the Title ------------------------------------------------------------
+
+
+def test_title_short_forms_for_the_recommended_keys():
+    assert summarize_inputs("accuracy", {"subject": [40, 45], "date": ["20260203", "20251124"]}
+                            ) == "accuracy sub-40,45 20251124-20260203"
+    assert summarize_inputs("x", {"subject": "mouseA", "date": 20251124, "session": [1, 2]}
+                            ) == "x sub-mouseA 20251124 ses-1,2"
+    assert summarize_inputs("plain") == "plain"
+
+
+def test_title_date_ranges_and_formats():
+    assert summarize_inputs("x", {"date": ["20251124/20251130", "20260101-20260115"]}
+                            ) == "x 20251124-20260115"
+    assert summarize_inputs("x", {"date": "2025-11-24/2025-11-30"}) == "x 2025-11-24-2025-11-30"
+    # Formats that do not sort are listed as given.
+    assert summarize_inputs("x", {"date": ["20261002", "03oct2026"]}) == "x 20261002,03oct2026"
+    assert summarize_inputs("x", {"date": "03oct2026/10oct2026"}) == "x 03oct2026-10oct2026"
+
+
+def test_title_reads_mappings():
+    assert summarize_inputs("x", {"subject": {"40": "20251124/20251130",
+                                              "41": "20260101/20260115"}}
+                            ) == "x sub-40,41 20251124-20260115"
+    assert summarize_inputs("x", {"subject": {"40": {"session": [1, 2]},
+                                              "41": {"session": [2, 3]}}}
+                            ) == "x sub-40,41 ses-1,2,3"
+
+
+def test_title_other_keys_one_line_and_capped():
+    assert summarize_inputs("x", {"condition": ["A", "B"], "subject": 1}
+                            ) == "x sub-1 condition=A,B"
+    long = summarize_inputs("x", {"note": "line\nbreak", "subject": list(range(500))})
+    assert "\n" not in long and len(long) == MAX_TITLE and long.endswith("...")
+
+
+# --- record size ----------------------------------------------------------
+
+
+def test_a_record_over_the_cap_warns_cuts_the_largest_and_still_saves():
+    def plot(trials, frame, fig_dir, window=50):
+        fig, ax = plt.subplots()
+        path = save(fig, "big", fig_dir=fig_dir)
+        plt.close(fig)
+        return path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path, caught = _caught(plot, list(range(10_000)), np.zeros(3), tmp)
+        got = read_figure_metadata(path)
+    assert len(caught) == 1, caught
+    message = str(caught[0].message)
+    assert "big.pdf" in message and "30,000" in message and "params['trials']" in message
+    assert caught[0].filename == __file__
+    assert got["params"]["trials"].startswith("<cut, ")
+    assert "frame" not in got["params"]  # a data summary, dropped first
+    assert got["params"]["window"] == 50 and got["function"] == "plot"
+
+
+def test_inputs_are_cut_after_parameters_and_the_code_fields_never():
+    record = {"schema": 1, "commit": "abc1234", "function": "f", "chain": ["f"],
+              "params": {"a": 1}, "inputs": {"subject": list(range(10_000))}}
+    blob, caught = _caught(_dump, record, "fig.pdf")
+    parsed = json.loads(blob)
+    assert len(blob) <= MAX_BLOB and len(caught) == 1
+    assert parsed["inputs"]["subject"].startswith("<cut, ") and parsed["params"] == {"a": 1}
+
+    blob, caught = _caught(_dump, {**record, "note": "x" * 40_000}, "fig.pdf")
+    parsed = json.loads(blob)
+    assert len(blob) <= MAX_BLOB
+    assert parsed == {"schema": 1, "commit": "abc1234", "function": "f", "chain": ["f"]}
+    assert "every field but the code" in str(caught[0].message)
+
+
+def test_blob_stays_ascii_so_the_pdf_string_encoding_is_predictable():
+    """Any non-ASCII character makes matplotlib write the string as UTF-16BE."""
+    blob = _dump({"params": record_value({"unicode": "µ ± σ °C"})}, "x")
+    blob.encode("ascii")  # must not raise
+
+
+# --- saving ---------------------------------------------------------------
+
+
+def test_pdf_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        fig, ax = plt.subplots()
+        ax.plot([1, 2, 3], [1, 4, 9])
+        path = save(fig, "accuracy", fig_dir=tmp,
+                    inputs={"subject": [40, 66], "date": [20251124, 20260203]})
+        plt.close(fig)
+        assert path.exists() and path.name == "accuracy.pdf"
+
+        got = read_figure_metadata(path)
+        assert got["function"] == "test_pdf_round_trip"
+        assert got["file"] == "test_provenance.py"
+        assert got["inputs"] == {"subject": [40, 66], "date": [20251124, 20260203]}
+        assert got["_title"] == "accuracy sub-40,66 20251124-20260203"
+        assert got["schema"] == 1 and "created_at" in got
+
+
+def test_save_takes_a_figure_an_axes_or_a_seaborn_grid():
+    fig, ax = plt.subplots()
+    in_subfigure = plt.figure().subfigures(1, 2)[0].subplots()
+    grid = type("FacetGrid", (), {"__module__": "seaborn.axisgrid"})()
+    grid.figure = fig
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, obj in enumerate((fig, ax, in_subfigure, grid)):
+            assert save(obj, f"f{i}", fig_dir=tmp).exists()
+        for bad in (None, [ax], np.array([ax]), "fig"):
+            try:
+                save(bad, "x", fig_dir=tmp)
+            except TypeError as e:
+                assert "Figure, an Axes or a seaborn grid" in str(e)
+            else:
+                raise AssertionError(f"no TypeError for {bad!r}")
+    plt.close("all")
+
+
+def test_filename_a_string_or_a_callable_and_a_new_fig_dir():
+    seen = []
+
+    def name_it(name, inputs):
+        seen.append((name, inputs))
+        return f"{name}_sub-{inputs['subjids'][0]}.pdf"
+
+    def plot(subjids, fig_dir):
+        fig, ax = plt.subplots()
+        path = save(fig, "acc", fig_dir=fig_dir, filename=name_it, inputs=["subjids"])
+        plt.close(fig)
+        return path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assert plot([40, 45], tmp) == Path(tmp) / "acc_sub-40.pdf"
+        assert seen == [("acc", {"subjids": [40, 45]})]
+
+        fig, ax = plt.subplots()
+        path = save(fig, "x", fig_dir=Path(tmp) / "new", filename="x_sub-040.pdf")
+        plt.close(fig)
+        assert path == Path(tmp) / "new" / "x_sub-040.pdf" and path.exists()
+
+
+def test_explicit_provenance_overrides_introspection_and_gets_the_inputs():
+    explicit = {"function": "the_real_plotter", "note": "explicit"}
+    with tempfile.TemporaryDirectory() as tmp:
+        fig, ax = plt.subplots()
+        path = save(fig, "x", fig_dir=tmp, inputs={"subject": 1}, provenance=explicit)
+        plt.close(fig)
+        got = read_figure_metadata(path)
+    assert got["function"] == "the_real_plotter" and got["note"] == "explicit"
+    assert got["inputs"] == {"subject": 1}
+    assert explicit == {"function": "the_real_plotter", "note": "explicit"}  # not mutated
+
+
+def test_creator_names_the_package_or_backstamp():
+    assert build_pdf_metadata("x", {"module": "lab.plots", "version": "1.2"}
+                              )["Creator"] == "lab.plots 1.2"
+    assert build_pdf_metadata("x", {"module": "__main__"}
+                              )["Creator"] == f"backstamp {backstamp.__version__}"
+
+
+def test_metadata_in_your_own_savefig_and_pdfpages():
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    def plot_accuracy(subjids, out):
+        fig, ax = plt.subplots()
+        fig.savefig(out / "own.pdf", metadata=backstamp.metadata(inputs=["subjids"]))
+        with PdfPages(out / "pages.pdf", metadata=backstamp.metadata("pages")) as pdf:
+            pdf.savefig(fig)
+        plt.close(fig)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        _, caught = _caught(plot_accuracy, [40], out)
+        own = read_figure_metadata(out / "own.pdf")
+        pages = read_figure_metadata(out / "pages.pdf")
+    assert not caught
+    assert own["function"] == "plot_accuracy" and own["inputs"] == {"subjids": [40]}
+    assert own["_title"] == "plot_accuracy subjids=40"
+    assert pages["function"] == "plot_accuracy" and pages["_title"] == "pages"
 
 
 def test_filter_metadata_drops_keys_matplotlib_would_reject():
@@ -207,68 +614,21 @@ def test_filter_metadata_drops_keys_matplotlib_would_reject():
     assert out == {"Title": "t", "Subject": "s"}
 
 
-def test_oversized_records_are_shrunk_not_dropped():
-    huge = {"function": "f", "params": {f"k{i}": "v" * 100 for i in range(200)}}
-    blob = build_pdf_metadata("n", provenance=huge)["Subject"]
-    assert len(blob) <= MAX_BLOB
-    assert json.loads(blob)["function"] == "f"  # the identifying fields survive
-
-
-def test_pdf_round_trip():
-    """Save a real figure and read its provenance back out."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fig, ax = plt.subplots()
-        ax.plot([1, 2, 3], [1, 4, 9])
-        path = save(fig, "accuracy", fig_dir=tmp, subjids=[40, 66],
-                    dates=[20251124, 20260203])
-        plt.close(fig)
-        assert path.exists() and path.name == "accuracy.pdf"
-
-        got = read_figure_metadata(path)
-        assert got["function"] == "test_pdf_round_trip"
-        assert got["file"] == "test_provenance.py"
-        assert got["subjids"] == ["040", "066"]
-        assert got["dates"] == ["20251124", "20260203"]
-        assert got["_title"] == "accuracy sub-040,066 20251124-20260203"
-        assert "created_at" in got
-
-
-def test_filename_and_a_new_fig_dir():
-    with tempfile.TemporaryDirectory() as tmp:
-        fig, ax = plt.subplots()
-        path = save(fig, "x", fig_dir=Path(tmp) / "new", filename="x_sub-040.pdf")
-        plt.close(fig)
-        assert path == Path(tmp) / "new" / "x_sub-040.pdf" and path.exists()
-
-
-def test_explicit_provenance_overrides_introspection():
-    with tempfile.TemporaryDirectory() as tmp:
-        fig, ax = plt.subplots()
-        path = save(fig, "x", fig_dir=tmp, subjids=1,
-                    provenance={"function": "the_real_plotter", "note": "explicit"})
-        plt.close(fig)
-        got = read_figure_metadata(path)
-        assert got["function"] == "the_real_plotter" and got["note"] == "explicit"
-
-
 def test_saving_never_warns_about_infodict_keys():
-    import warnings
-
     with tempfile.TemporaryDirectory() as tmp:
         fig, ax = plt.subplots()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            save(fig, "x", fig_dir=tmp, subjids=1, metadata={"Bogus": "dropped"})
+            save(fig, "x", fig_dir=tmp, metadata={"Bogus": "dropped"})
         plt.close(fig)
         assert not [w for w in caught if "infodict" in str(w.message)]
 
 
-def test_reading_a_provenance_free_or_missing_pdf_returns_empty():
-    """Empty must mean "no provenance", so `if not read_figure_metadata(p)` is usable.
+# --- reading --------------------------------------------------------------
 
-    matplotlib stamps a Creator on every PDF it writes, so a bare figure is not an
-    empty info dictionary -- it just has nothing of ours in it.
-    """
+
+def test_reading_a_provenance_free_or_missing_pdf_returns_empty():
+    """``{}`` must mean "no record", so ``if not read_figure_metadata(p)`` works."""
     with tempfile.TemporaryDirectory() as tmp:
         fig, ax = plt.subplots()
         bare = Path(tmp) / "bare.pdf"
@@ -280,30 +640,62 @@ def test_reading_a_provenance_free_or_missing_pdf_returns_empty():
         assert read_figure_metadata(Path(tmp) / "junk.pdf") == {}
 
 
+def test_reads_an_unversioned_record():
+    """``fixtures/unversioned.pdf``, saved by hypnose-helpers 83dfc95: no ``schema``,
+    ``subjids`` and ``dates`` at the top level."""
+    from backstamp._pdf import _read_info_stdlib
+
+    path = FIXTURES / "unversioned.pdf"
+    got = read_figure_metadata(path)
+    assert "schema" not in got and "inputs" not in got
+    assert got["function"] == "plot_accuracy" and got["commit"] == "88e7495"
+    assert got["subjids"] == ["040", "066"] and got["dates"] == ["20251124", "20251130"]
+    assert got["params"] == {"subjids": [40, 66], "dates": ["20251124", "20251130"],
+                             "window": 50}
+    assert got["_title"] == "accuracy sub-040,066 20251124-20251130"
+    assert got["_creator"] == "hypnose"
+    assert json.loads(_read_info_stdlib(path)["Subject"])["subjids"] == ["040", "066"]
+
+
 def test_stdlib_reader_matches_on_awkward_characters():
     """Both readers: pypdf through read_figure_metadata, and the stdlib fallback directly."""
-    from backstamp.metadata import _read_info_stdlib
+    from backstamp._pdf import _read_info_stdlib
 
     with tempfile.TemporaryDirectory() as tmp:
         fig, ax = plt.subplots()
         note = r"parens ( ) and \ backslash"
-        path = save(fig, "x", fig_dir=tmp, subjids=1,
-                    provenance={"function": "f", "note": note})
+        path = save(fig, "x", fig_dir=tmp, provenance={"function": "f", "note": note})
         plt.close(fig)
         assert json.loads(_read_info_stdlib(path)["Subject"])["note"] == note
         assert read_figure_metadata(path)["note"] == note
 
 
+def test_round_trip_keeps_long_and_non_ascii_arguments():
+    with tempfile.TemporaryDirectory() as tmp:
+        fig, ax = plt.subplots()
+        path = save(fig, "x", fig_dir=tmp, provenance={
+            "function": "f",
+            "params": record_value({"many": list(range(99)), "unicode": "µ ± σ °C"}),
+        })
+        plt.close(fig)
+        got = read_figure_metadata(path)
+        assert got["function"] == "f"
+        assert got["params"]["many"] == list(range(99))
+        assert got["params"]["unicode"] == "µ ± σ °C"
+
+
+# --- wrappers and the chain -----------------------------------------------
+
+
 def test_a_wrapper_can_exclude_itself():
-    """A repo whose save function is a thin wrapper must not name itself as the plotter.
+    """A thin wrapper around save must not be recorded as the plotter.
 
     Capturing inside the wrapper is not enough -- capture_call still returns the
     wrapper's own frame. Only the skip list fixes it.
     """
     import types
 
-    # A stand-in for hypnose_behavior.io.save, in its own module namespace -- the
-    # wrapper and the plotter must not share one, or skipping hides both.
+    # The wrapper and the plotter need separate module namespaces, or skipping hides both.
     wrapper_mod = types.ModuleType("fake_repo.io.save")
     wrapper_mod.provenance = provenance
     exec(
@@ -342,12 +734,8 @@ def test_save_forwards_skip_modules():
 
 
 def test_chain_reaches_past_an_inner_save_closure():
-    """The real case from movement_analysis_utils: a nested `_save_fig` helper.
-
-    `function` can only ever be "the nearest frame we did not skip", and in real
-    plotting code that is often a local closure rather than the analysis that produced
-    the figure. The chain is what makes the enclosing function recoverable.
-    """
+    """``function`` is the nearest frame not skipped, often a local closure; the chain
+    keeps the function around it."""
     def run_movement_stats_batch():
         def _save_fig():  # the closure that actually calls save
             return provenance()
@@ -364,40 +752,13 @@ def test_chain_survives_the_pdf_round_trip():
         def analysis():
             def _save_fig():
                 fig, ax = plt.subplots()
-                path = save(fig, "x", fig_dir=tmp, subjids=1)
+                path = save(fig, "x", fig_dir=tmp)
                 plt.close(fig)
                 return path
             return _save_fig()
 
         got = read_figure_metadata(analysis())
         assert got["chain"][:2] == ["_save_fig", "analysis"]
-
-
-def test_blob_stays_ascii_so_the_pdf_string_encoding_is_predictable():
-    """Any non-ASCII character makes matplotlib write the string as UTF-16BE.
-
-    The truncation markers used to be "…", which silently switched the encoding and
-    broke the stdlib reader for exactly the records that needed truncating.
-    """
-    from backstamp.metadata import _dump
-
-    blob = _dump({"params": summarize_value({"big": list(range(99)), "s": "y" * 300})})
-    blob.encode("ascii")  # must not raise
-    assert "..." in blob
-
-
-def test_round_trip_survives_truncation_and_non_ascii_arguments():
-    with tempfile.TemporaryDirectory() as tmp:
-        fig, ax = plt.subplots()
-        path = save(fig, "x", fig_dir=tmp, subjids=1, provenance={
-            "function": "f",
-            "params": summarize_value({"many": list(range(99)), "unicode": "µ ± σ °C"}),
-        })
-        plt.close(fig)
-        got = read_figure_metadata(path)
-        assert got["function"] == "f"
-        assert got["params"]["many"][-1] == "...+89 more"
-        assert got["params"]["unicode"] == "µ ± σ °C"
 
 
 def main() -> int:

@@ -1,95 +1,177 @@
-"""What produced this output: commit, version, and the call that made it.
+"""The provenance record: which code ran, called how, on which data.
 
-A figure or a results file that cannot be traced back to the code that made it is a
-figure you have to reproduce from scratch before you can trust it. This module builds a
-small, JSON-safe record answering "which code, which version, called how" -- embedded in
-saved PDFs (`metadata`) and, from Phase 7, in `manifest.json` as well. One
-implementation, so the two cannot drift.
+`backstamp.save` and `backstamp.metadata` embed it in a figure; `provenance()` returns it
+for any other output.
 
-**Anchoring, and why there is no default.** `git_commit()` takes the path of the code
-whose commit you want. It must be the *caller's* file: backstamp is installed as a
-library, so anchoring on ``__file__`` here would stamp every figure from every repo with
-the backstamp commit -- plausible-looking and wrong, the same silent-resolution failure
-that `io/paths` hit in restructure_2 Phase 2a and `io/layout` in 2b. `capture_call()`
-finds the calling frame, and `provenance()` anchors on its file.
-
-Nothing here raises. Provenance is a nice-to-have attached to real work, so a detached
-HEAD, a missing `git`, an unreadable frame or an exotic argument type degrades to a
-`None` field or a `<TypeName>` placeholder -- never a failed save.
+- The commit is anchored on the calling code's file. backstamp is installed as a library,
+  so its own file would stamp every figure with the backstamp commit.
+- Nothing here raises on a bad environment. A detached HEAD, a missing ``git``, an
+  unreadable frame or an unknown object costs a field or becomes a ``<TypeName>``
+  placeholder, never the save.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
+import math
+import os
+import platform
+import re
 import subprocess
-from datetime import datetime
-from pathlib import Path
+import warnings
+from datetime import date, datetime
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
-# Truncation limits. The PDF info dictionary is not a database: the record has to stay
-# small enough to sit in one string value, so containers are sampled rather than stored.
-MAX_ITEMS = 10
-MAX_STR = 80
-MAX_PARAMS = 15
+# The record layout, stored as ``schema``.
+SCHEMA = 1
 
-# How many enclosing function names to keep alongside `function`. Four reaches past a
-# local _save_fig closure and its enclosing analysis function without bloating the blob.
+# How many function names `chain` keeps, nearest first. Four reaches past a local
+# ``_save_fig`` closure and the analysis function around it.
 MAX_CHAIN = 4
 
-# Frames belonging to the saving machinery itself, never the answer to "who plotted this".
-_SKIP_MODULES = (
-    "backstamp.provenance",
-    "backstamp.save",
-    "backstamp.metadata",
-)
+# backstamp's own frames, never the answer to "who made this".
+_SKIP_MODULES = ("backstamp.provenance", "backstamp._pdf", "backstamp._save")
 
 _GIT_TIMEOUT = 5
+
+PATHS = ("name", "full", "hide")
+
+_config = {"paths": "name", "redact": ()}
+
+
+# --- settings -------------------------------------------------------------
+
+
+def configure(*, paths: str | None = None, redact=None) -> None:
+    """Set ``paths`` and ``redact`` for every later record in this process.
+
+    - An argument left out keeps its setting.
+    - ``paths`` on a `save`, `metadata` or `provenance` call overrides this one. ``redact``
+      on a call adds to this list, so a name configured here is always redacted.
+    """
+    if paths is not None:
+        _config["paths"] = _check_paths(paths)
+    if redact is not None:
+        _config["redact"] = _check_redact(redact)
+
+
+def _options(paths=None, redact=None) -> tuple:
+    """``(paths, redact)`` for one call: `configure`'s, overridden or added to by the call's."""
+    redacted = _config["redact"]
+    if redact is not None:
+        redacted += tuple(n for n in _check_redact(redact) if n not in redacted)
+    return (_check_paths(paths) if paths is not None else _config["paths"], redacted)
+
+
+def _check_paths(paths):
+    if paths not in PATHS:
+        raise ValueError(f"paths must be one of {', '.join(map(repr, PATHS))}, not {paths!r}")
+    return paths
+
+
+def _check_redact(redact) -> tuple:
+    names = (redact,) if isinstance(redact, str) else redact
+    if not isinstance(names, (list, tuple, set, frozenset)) or not all(
+            isinstance(n, str) for n in names):
+        raise TypeError(f"redact takes a list of parameter names, not {redact!r}")
+    return tuple(names)
+
+
+def check_inputs(inputs):
+    """``inputs`` as a dict or a tuple of parameter names; anything else raises."""
+    if inputs is None or isinstance(inputs, dict):
+        return inputs
+    names = (inputs,) if isinstance(inputs, str) else inputs
+    if isinstance(names, (list, tuple)) and all(isinstance(n, str) for n in names):
+        return tuple(names)
+    raise TypeError(
+        f"inputs takes a dict, or a list of the plotting function's parameter names, "
+        f"not {type(inputs).__name__}")
+
+
+def _warn(message: str) -> None:
+    """Warn at the first frame outside backstamp."""
+    level, frame = 1, inspect.currentframe()
+    while frame is not None and frame.f_globals.get("__name__") in _SKIP_MODULES:
+        frame, level = frame.f_back, level + 1
+    warnings.warn(message, UserWarning, stacklevel=level)
 
 
 # --- git ------------------------------------------------------------------
 
 
-def _git(args, cwd) -> str | None:
+def _git(args, cwd, *, text=True):
     try:
         out = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            ["git", *args], cwd=str(cwd), capture_output=True, text=text,
             timeout=_GIT_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout.strip() if out.returncode == 0 else None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() if text else out.stdout
 
 
-def git_commit(anchor) -> str | None:
-    """Short commit of the repo containing ``anchor``, ``-dirty`` if it has changes.
-
-    ``anchor`` is a file or directory *inside the repo you want described* -- see the
-    module docstring on why this has no default.
-
-    The dirty suffix is not decoration: a bare hash on a modified tree points at code
-    that is not what ran, which is worse than recording nothing.
-    """
+def _git_dir(anchor) -> Path | None:
     if anchor is None:
         return None
     anchor = Path(anchor)
     cwd = anchor.parent if anchor.is_file() else anchor
-    if not cwd.exists():
-        return None
+    return cwd if cwd.exists() else None
 
-    commit = _git(["rev-parse", "--short", "HEAD"], cwd)
+
+def git_commit(anchor) -> str | None:
+    """Short commit of the repo holding ``anchor``, ending ``-dirty`` when it has changes.
+
+    - Untracked files count as changes: a new module the code imports changes what ran.
+    """
+    cwd = _git_dir(anchor)
+    commit = _git(["rev-parse", "--short", "HEAD"], cwd) if cwd else None
     if not commit:
         return None
-    # `git status` can be slow on a large tree; this is the cheap equivalent that still
-    # sees both tracked modifications and untracked files.
     status = _git(["status", "--porcelain", "--untracked-files=normal"], cwd)
     return f"{commit}-dirty" if status else commit
+
+
+def git_info(anchor) -> dict:
+    """``commit``, ``branch``, ``repo`` and, when dirty, ``diff_sha`` of the repo holding ``anchor``.
+
+    - ``diff_sha`` hashes ``git diff HEAD``, so dirty figures can be matched to one
+      working-tree state. Untracked files are not in it.
+    - ``repo`` is ``origin``'s URL without credentials; ``branch`` is ``None`` on a
+      detached HEAD. Outside a repo the dict is empty.
+    """
+    commit = git_commit(anchor)
+    if commit is None:
+        return {}
+    cwd = _git_dir(anchor)
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    info = {
+        "commit": commit,
+        "branch": None if branch == "HEAD" else branch,
+        "repo": _strip_credentials(_git(["remote", "get-url", "origin"], cwd)),
+    }
+    if commit.endswith("-dirty"):
+        diff = _git(["diff", "HEAD", "--no-color", "--no-ext-diff"], cwd, text=False)
+        if diff is not None:
+            info["diff_sha"] = hashlib.sha256(diff).hexdigest()[:12]
+    return info
+
+
+def _strip_credentials(url: str | None) -> str | None:
+    """``https://user:token@host/x`` -> ``https://host/x``. ``git@host:x`` has none."""
+    if not url:
+        return None
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@", r"\1", url)
 
 
 def package_version(module_name: str | None) -> str | None:
     """Installed version of the distribution providing ``module_name``'s top package.
 
-    The import package and the distribution are routinely named differently -- this
-    family ships `hypnose_behavior` from `hypnose-behavior-analysis` -- so guessing by
-    swapping underscores for hyphens finds nothing. `packages_distributions()` is the
-    real mapping; the guess is only a fallback for Python 3.9, which lacks it.
+    - Found through ``packages_distributions()``, since import and distribution names
+      often differ. Python 3.9 lacks it and tries the import name instead.
     """
     if not module_name:
         return None
@@ -118,101 +200,135 @@ def package_version(module_name: str | None) -> str | None:
     return None
 
 
-# --- value summarising ----------------------------------------------------
+# --- values ---------------------------------------------------------------
+
+# Text read as a path: absolute POSIX, home-relative, a Windows drive, or a UNC share.
+_ABSOLUTE = re.compile(r"/|~[/\\]|[A-Za-z]:[/\\]|\\\\")
+_WINDOWS = re.compile(r"[A-Za-z]:|\\\\")
+
+# backstamp's own placeholders, as opposed to a summarised object.
+_MARKERS = ("<redacted>", "<path>", "<cycle>")
 
 
-def summarize_value(value, *, max_items: int = MAX_ITEMS, max_str: int = MAX_STR):
-    """Render one call argument as something small and JSON-safe.
+def record_value(value, *, paths: str = "name", ranges: bool = False):
+    """One value as JSON-safe data, in full.
 
-    Scalars pass through, strings truncate, containers are sampled, and arrays and
-    frames become shape descriptors (``<DataFrame 50x2>``) rather than being serialised
-    -- the point is to recognise the call later, not to reconstruct its inputs.
+    - Numbers, text, booleans, ``None`` and containers of these are kept. numpy scalars
+      become plain numbers, dates ISO text and dict keys text; sets are sorted.
+    - Paths follow ``paths``: a `Path`, or text starting ``/``, ``~/``, ``C:\\`` or ``\\\\``.
+    - Data objects become their type and shape (``<DataFrame 50x2>``), any other object
+      ``<TypeName>``.
+    - ``ranges``: a tuple of two values becomes the range ``"start/end"``, as in ``inputs``.
     """
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int):
+    return _value(value, paths, ranges, ())
+
+
+def _value(value, paths, ranges, seen):
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
-        # Guard against NaN/inf, which are not valid JSON.
-        return value if value == value and abs(value) != float("inf") else str(value)
+        return value if math.isfinite(value) else str(value)  # NaN is not valid JSON
     if isinstance(value, str):
-        return value if len(value) <= max_str else value[: max_str - 3] + "..."
-    if isinstance(value, Path):
-        return summarize_value(str(value), max_str=max_str)
-
-    described = _describe_scientific(value)
+        return _path(value, paths) if _ABSOLUTE.match(value) else str(value)
+    if isinstance(value, os.PathLike):
+        try:
+            return _path(os.fspath(value), paths, value)
+        except Exception:
+            return "<path>"
+    if isinstance(value, date):
+        return value.isoformat()
+    if type(value).__module__ == "numpy" and getattr(value, "ndim", None) == 0:
+        try:
+            return _value(value.item(), paths, ranges, seen)
+        except Exception:
+            pass
+    described = _describe(value)
     if described is not None:
         return described
+    if not isinstance(value, (dict, list, tuple, set, frozenset)):
+        return f"<{type(value).__name__}>"
 
+    if id(value) in seen:
+        return "<cycle>"
+    seen = (*seen, id(value))
     if isinstance(value, dict):
-        out = {
-            str(k): summarize_value(v, max_items=max_items, max_str=max_str)
-            for k, v in list(value.items())[:max_items]
-        }
-        if len(value) > max_items:
-            out["..."] = f"+{len(value) - max_items} more"
-        return out
-    if isinstance(value, (list, tuple, set, frozenset)):
-        items = list(value)
-        out = [summarize_value(v, max_items=max_items, max_str=max_str)
-               for v in items[:max_items]]
-        if len(items) > max_items:
-            out.append(f"...+{len(items) - max_items} more")
-        return out
-
-    return f"<{type(value).__name__}>"
+        return {_key(k, paths, ranges): _value(v, paths, ranges, seen)
+                for k, v in value.items()}
+    if ranges and type(value) is tuple and len(value) == 2:
+        ends = [_value(v, paths, False, seen) for v in value]
+        if all(isinstance(e, (str, int, float)) and not isinstance(e, bool) for e in ends):
+            return f"{ends[0]}/{ends[1]}"
+    items = _sorted(value) if isinstance(value, (set, frozenset)) else value
+    return [_value(v, paths, ranges, seen) for v in items]
 
 
-def _describe_scientific(value) -> str | None:
-    """Shape descriptors for pandas/numpy/matplotlib objects, without importing them.
+def _key(key, paths, ranges) -> str:
+    out = _value(key, paths, ranges, ())
+    return out if isinstance(out, str) else json.dumps(out)
 
-    Dispatching on the type's module keeps this module importable (and fast) in an
-    environment where numpy or matplotlib is absent, and avoids paying an import just to
-    describe an argument.
-    """
-    module = type(value).__module__.split(".")[0]
-    name = type(value).__name__
 
-    if module == "pandas":
-        if name == "DataFrame":
-            try:
-                return f"<DataFrame {value.shape[0]}x{value.shape[1]}>"
-            except Exception:
-                return "<DataFrame>"
-        if name == "Series":
-            try:
-                return f"<Series {len(value)} {value.dtype}>"
-            except Exception:
-                return "<Series>"
-    if module == "numpy" and name == "ndarray":
-        try:
+def _sorted(items) -> list:
+    try:
+        return sorted(items)
+    except TypeError:
+        return sorted(items, key=repr)
+
+
+def _path(text: str, paths: str, obj=None) -> str:
+    if paths == "full":
+        return text
+    if paths == "hide":
+        return "<path>"
+    if isinstance(obj, PurePath):
+        name = obj.name
+    else:
+        name = (PureWindowsPath if _WINDOWS.match(text) else PurePosixPath)(text).name
+    return name or text
+
+
+def _describe(value) -> str | None:
+    """Type and shape of a data or plotting object, without importing its library."""
+    cls = type(value)
+    module, name = cls.__module__.split(".")[0], cls.__name__
+    try:
+        if module == "pandas" and name == "DataFrame":
+            return f"<DataFrame {value.shape[0]}x{value.shape[1]}>"
+        if module == "pandas" and name == "Series":
+            return f"<Series {len(value)} {value.dtype}>"
+        if module == "numpy" and name == "ndarray":
             return f"<ndarray {tuple(value.shape)} {value.dtype}>"
-        except Exception:
-            return "<ndarray>"
-    if module == "matplotlib":
+        if module == "matplotlib":
+            return f"<{name}>"
+        shape = getattr(value, "shape", None)
+        if isinstance(shape, tuple):
+            return f"<{name} {tuple(shape)}>"
+    except Exception:
         return f"<{name}>"
     return None
+
+
+def is_summary(value) -> bool:
+    """Whether ``value`` is a ``<TypeName …>`` summary of an object `record_value` could not keep."""
+    return (isinstance(value, str) and value not in _MARKERS
+            and re.fullmatch(r"<[A-Za-z_]\w*( [^<>]*)?>", value) is not None)
 
 
 # --- the calling frame ----------------------------------------------------
 
 
-def capture_call(*, skip_modules=(), max_params: int = MAX_PARAMS) -> dict | None:
-    """Describe the nearest frame that is not saving machinery.
+def capture_call(*, skip_modules=()) -> dict | None:
+    """The nearest frame outside backstamp and ``skip_modules``: the call that made the output.
 
-    Returns ``{"function", "file", "lineno", "params"}``, where ``params`` covers the
-    named arguments *and* anything that arrived via ``**kwargs``.
+    Returns ``function``, ``module``, ``file``, ``lineno``, ``chain``, ``args`` and ``path``.
 
-    Also returns ``chain``: the next few enclosing function names. Frame-walking is
-    inherently fragile -- ``function`` is only ever "the nearest frame we did not skip",
-    and in real code that is often a local ``_save_fig`` closure rather than the analysis
-    that produced the figure. The chain makes the real caller recoverable anyway, which a
-    single frame cannot. Extend ``skip_modules``, or pass an explicit record to
-    `save`, when even that is not enough.
+    - ``chain``: up to `MAX_CHAIN` function names, nearest first. ``function`` is often a
+      local ``_save_fig`` closure; ``chain`` keeps the analysis around it.
+    - ``args``: every parameter's current value, unconverted.
+    - ``path``: the file's full path, the git anchor. The record does not store it.
     """
     skip = set(_SKIP_MODULES) | set(skip_modules)
     try:
-        stack = inspect.stack()
+        stack = inspect.stack(0)
     except Exception:
         return None
     try:
@@ -232,72 +348,109 @@ def capture_call(*, skip_modules=(), max_params: int = MAX_PARAMS) -> dict | Non
             "path": entry.filename,
             "lineno": entry.lineno,
             "chain": [e.function for e in kept[:MAX_CHAIN]],
-            "params": _frame_params(entry.frame, max_params),
+            "args": _frame_args(entry.frame),
         }
     except Exception:
         return None
     finally:
-        # inspect.stack() holds frame references; dropping them promptly keeps large
-        # plotting locals from being kept alive by a reference cycle.
+        # Frame references would keep large plotting locals alive through a cycle.
         del stack
 
 
-def _frame_params(frame, max_params: int) -> dict:
+def _frame_args(frame) -> dict:
+    """Every parameter of ``frame``'s function by name, ``*args`` and ``**kwargs`` included."""
     try:
         info = inspect.getargvalues(frame)
     except Exception:
         return {}
-    params: dict = {}
-    for name in info.args:
-        if name in ("self", "cls"):
-            continue
-        params[name] = summarize_value(info.locals.get(name))
-    if info.keywords:  # the **kwargs catch-all: record what was actually passed
+    args = {name: info.locals.get(name) for name in info.args if name not in ("self", "cls")}
+    if info.varargs:
+        args[info.varargs] = list(info.locals.get(info.varargs) or ())
+    if info.keywords:
         for name, value in (info.locals.get(info.keywords) or {}).items():
-            params[str(name)] = summarize_value(value)
-    if len(params) > max_params:
-        kept = dict(list(params.items())[:max_params])
-        kept["..."] = f"+{len(params) - max_params} more"
-        return kept
-    return params
+            args[str(name)] = value
+    return args
+
+
+def resolve_inputs(inputs, source) -> dict | None:
+    """``inputs`` as a dict of values as given.
+
+    - A list of names is looked up in ``source``: the ``args`` of a `capture_call` result,
+      or the ``params`` of a record. A name not found warns and is left out.
+    """
+    inputs = check_inputs(inputs)
+    if inputs is None or isinstance(inputs, dict):
+        return inputs
+    source = source if isinstance(source, dict) else {}
+    args = source.get("args", source.get("params")) or {}
+    out = {}
+    for name in inputs:
+        if name in args:
+            out[name] = args[name]
+        else:
+            _warn(f"backstamp: {source.get('function', 'the calling function')}() has no "
+                  f"parameter {name!r}, so it is not in the inputs")
+    return out
+
+
+def inputs_record(inputs: dict, paths: str = "name", redact=()) -> dict:
+    """``inputs`` as stored: JSON-safe, ``(start, end)`` tuples as ``"start/end"``."""
+    return {_key(k, paths, False): "<redacted>" if k in redact
+            else record_value(v, paths=paths, ranges=True) for k, v in inputs.items()}
 
 
 # --- the record -----------------------------------------------------------
 
 
-def provenance(*, anchor=None, call: dict | None = None, extra: dict | None = None,
-               skip_modules=()) -> dict:
-    """A record of what produced this output.
+def provenance(*, anchor=None, call: dict | None = None, inputs=None, paths=None,
+               redact=None, extra: dict | None = None, skip_modules=()) -> dict:
+    """The record of what produced an output, as JSON-safe data.
 
-    ``call`` is a `capture_call` result; when omitted, one is captured here. ``anchor``
-    defaults to the calling code's own file, so the commit describes the repo that ran
-    rather than whichever repo happens to host this function.
-
-    ``skip_modules`` is forwarded to `capture_call`. A repo whose own save function is
-    a thin wrapper **must** pass its module name, or the capture names the wrapper
-    instead of the plotting function that called it.
+    - ``call``: a `capture_call` result; captured here when left out.
+    - ``anchor``: a file in the repo whose commit is recorded; the calling code's file by
+      default.
+    - ``inputs``, ``paths``, ``redact``, ``skip_modules``: as in `backstamp.save`.
+    - ``extra``: fields added to the record as given.
     """
+    from . import __version__
+
+    paths, redact = _options(paths, redact)
     if call is None:
         call = capture_call(skip_modules=skip_modules)
+    inputs = resolve_inputs(inputs, call)
     if anchor is None and call is not None:
         anchor = call.get("path")
 
     record = {
+        "schema": SCHEMA,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "commit": git_commit(anchor),
+        **git_info(anchor),
         "version": package_version(call.get("module") if call else None),
+        "python": platform.python_version(),
+        "backstamp": __version__,
     }
+    repo = record.get("repo")
+    if repo and (_ABSOLUTE.match(repo) or repo.startswith("file://")):
+        record["repo"] = _path(repo[len("file://"):] if repo.startswith("file://") else repo,
+                               paths)
     if call is not None:
-        record.update(
-            {k: call[k] for k in
-             ("function", "module", "file", "lineno", "chain", "params") if k in call}
-        )
+        record.update({k: call[k] for k in ("function", "module", "file", "lineno", "chain")
+                       if k in call})
+    if inputs is not None:
+        record["inputs"] = inputs_record(inputs, paths, redact)
+    if call is not None and "args" in call:
+        record["params"] = {name: "<redacted>" if name in redact
+                            else record_value(value, paths=paths)
+                            for name, value in call["args"].items()}
+    elif call is not None and "params" in call:
+        record["params"] = call["params"]
     if extra:
         record.update(extra)
     return {k: v for k, v in record.items() if v is not None}
 
 
 __all__ = [
-    "provenance", "git_commit", "package_version", "summarize_value", "capture_call",
-    "MAX_ITEMS", "MAX_STR", "MAX_PARAMS", "MAX_CHAIN",
+    "provenance", "configure", "capture_call", "git_commit", "git_info", "package_version",
+    "record_value", "resolve_inputs", "inputs_record", "check_inputs", "is_summary",
+    "SCHEMA", "MAX_CHAIN", "PATHS",
 ]
