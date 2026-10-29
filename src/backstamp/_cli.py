@@ -2,6 +2,7 @@
 
 - ``backstamp show`` with no path reads paths from the terminal, one line at a time, so
   figures can be dropped into the window.
+- Both read the figures inside decks and pdfLaTeX PDFs, one record each, by slide or page.
 """
 from __future__ import annotations
 
@@ -15,8 +16,9 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from ._inside import is_deck
 from ._pdf import _DATE, _NEXT, range_ends, summarize_inputs
-from ._read import read
+from ._read import _read_all
 
 _GLOB = re.compile(r"[*?[]")
 _INT = re.compile(r"[0-9]+")
@@ -32,9 +34,14 @@ def main(argv=None) -> int:
 
     show = commands.add_parser(
         "show", help="print each figure's record",
-        description="Print each figure's record. With no path, drop figures into the "
-                    "terminal one at a time.")
-    show.add_argument("paths", nargs="*", help="figures, folders or globs")
+        description="Print each figure's record; a deck or a PDF compiled with pdfLaTeX "
+                    "gives every figure inside, by slide or page. With no path, drop "
+                    "figures into the terminal one at a time.")
+    show.add_argument("paths", nargs="*", help="figures, decks, folders or globs")
+    show.add_argument("--slide", metavar="N", type=int, action="append", default=[],
+                      help="only the figures on slide N of a deck")
+    show.add_argument("--page", metavar="N", type=int, action="append", default=[],
+                      help="only the figures on page N of a PDF compiled with pdfLaTeX")
     mode = show.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true", help="every field, as JSON")
     mode.add_argument("--reproduce", action="store_true",
@@ -42,8 +49,9 @@ def main(argv=None) -> int:
 
     ls = commands.add_parser(
         "ls", help="list the figures in a folder",
-        description="One row per figure, searching folders recursively. Filters combine.")
-    ls.add_argument("folders", nargs="*", default=["."], help="folders or figures")
+        description="One row per figure, searching folders recursively; a figure inside a "
+                    "deck or a pdfLaTeX PDF gets a row of its own. Filters combine.")
+    ls.add_argument("folders", nargs="*", default=["."], help="folders, figures or decks")
     ls.add_argument("--dirty", action="store_true", help="made with uncommitted changes")
     ls.add_argument("--function", metavar="NAME",
                     help="made by NAME, or inside a call to NAME")
@@ -81,14 +89,24 @@ def main(argv=None) -> int:
 def _show(args, paths=None) -> int:
     """Print the records of ``paths``, or of ``args.paths``; 1 if any is missing or unreadable."""
     paths = args.paths if paths is None else paths
-    figures = _figures(paths)
-    if not figures:
-        print(f"backstamp: no PDFs in {' '.join(paths)}", file=sys.stderr)
+    files = _figures(paths)
+    if not files:
+        print(f"backstamp: no PDFs or decks in {' '.join(paths)}", file=sys.stderr)
         return 1
-    records = [read(f) for f in figures]
+    records = [r for f in files for r in _read_file(f)]
+    if args.slide or args.page:
+        records = [r for r in records if r.where and (
+            r.where.get("slide") in args.slide or r.where.get("page") in args.page)]
+        if not records:
+            wanted = [f"slide {n}" for n in args.slide] + [f"page {n}" for n in args.page]
+            print(f"backstamp: no figures on {', '.join(wanted)}", file=sys.stderr)
+            return 1
+    if not records:
+        return 1
     if args.json:
         data = [r.to_dict() for r in records]
-        one = len(paths) == 1 and len(figures) == 1 and Path(paths[0]).is_file()
+        one = (len(paths) == 1 and len(records) == 1 and not records[0].where
+               and Path(paths[0]).is_file())
         print(json.dumps(data[0] if one else data, indent=2, ensure_ascii=False))
     else:
         print("\n\n".join(r.reproduce() if args.reproduce else str(r) for r in records))
@@ -143,25 +161,45 @@ def _unquote(text: str) -> str:
 
 
 def _figures(paths) -> list:
-    """The PDFs ``paths`` name: files as given, folders searched, globs expanded."""
+    """The PDFs and decks ``paths`` name: files as given, folders searched, globs expanded."""
     found = []
     for arg in paths:
         path = Path(arg)
         matches = sorted(glob.glob(arg, recursive=True)) if (
             not path.exists() and _GLOB.search(arg)) else []
         for item in [Path(m) for m in matches] or [path]:
-            found += _pdfs(item) if item.is_dir() else [item]
+            found += _files(item) if _folder(item) else [item]
     return found
 
 
-def _pdfs(root: Path) -> list:
-    """The PDFs under ``root``, sorted; hidden files and folders skipped."""
+def _folder(path: Path) -> bool:
+    """A folder to search: a Keynote package folder is a deck instead."""
+    return path.is_dir() and not is_deck(path)
+
+
+def _files(root: Path) -> list:
+    """The PDFs and decks under ``root``, sorted; hidden files and folders skipped.
+
+    - Office lock files (``~$deck.pptx``) are skipped too.
+    """
     found = []
     for folder, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
-        found += [Path(folder) / f for f in sorted(files)
-                  if f.lower().endswith(".pdf") and not f.startswith(".")]
+        names = [f for f in files if f.lower().endswith(".pdf") or is_deck(f)]
+        names += [d for d in dirs if is_deck(d)]
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not is_deck(d))
+        found += [Path(folder) / n for n in sorted(names) if not n.startswith((".", "~$"))]
     return found
+
+
+def _read_file(path: Path) -> list:
+    """The records of the figures in ``path``; says so on stderr when a deck's list is short."""
+    records, ordered = _read_all(path)
+    if not records:
+        print(f"backstamp: {path}: no PDF figures inside", file=sys.stderr)
+    elif not ordered:
+        print(f"backstamp: {path}: could not read the slide order; its figures are listed "
+              f"without slide numbers", file=sys.stderr)
+    return records
 
 
 # --- ls -------------------------------------------------------------------
@@ -174,13 +212,13 @@ def _ls(args) -> int:
         if not root.exists():
             print(f"backstamp: no such folder: {arg}", file=sys.stderr)
             continue
-        for figure in _pdfs(root) if root.is_dir() else [root]:
-            rec = read(figure)
-            if _keep(rec, args):
-                name = figure.relative_to(root) if root.is_dir() else figure
-                if root.is_dir() and len(args.folders) > 1:
-                    name = root / name
-                rows.append((re.sub(r"\.pdf$", "", str(name), flags=re.I), rec))
+        folder = _folder(root)
+        for file in _files(root) if folder else [root]:
+            name = file.relative_to(root) if folder else file
+            if folder and len(args.folders) > 1:
+                name = root / name
+            name = re.sub(r"\.pdf$", "", str(name), flags=re.I)
+            rows += [(_label(name, rec), rec) for rec in _read_file(file) if _keep(rec, args)]
     if not rows:
         print("backstamp: no figures match", file=sys.stderr)
         return 1
@@ -189,6 +227,15 @@ def _ls(args) -> int:
     for r in table:
         print("  ".join(_fit(cell, w) for cell, w in zip(r, widths)).rstrip())
     return 0
+
+
+def _label(name: str, rec) -> str:
+    """A row's name; for a figure inside a file, with its slide or page and stored name."""
+    w = rec.where or {}
+    parts = [name] + [f"{key} {w[key]}" for key in ("slide", "page") if w.get(key) is not None]
+    if w.get("file"):
+        parts.append(re.sub(r"\.(pdf|emf)$", "", w["file"], flags=re.I))
+    return " ".join(parts)
 
 
 def _row(name: str, rec) -> tuple:

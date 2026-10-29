@@ -1,20 +1,25 @@
-"""Read a figure's provenance record back: `read` returns a `Record`.
+"""Read a figure's provenance record back: `read` returns a `Record`, `read_all` one per figure.
 
 - pypdf reads the PDF info dictionary, with its log lines silenced: a file that is not a
   PDF is ``unreadable``, quietly.
 - The record is the JSON object in ``Subject``. Any other ``Subject`` is another program's,
   and the figure is ``unstamped``.
+- `read_all` also reads the figures inside decks and pdfLaTeX PDFs: see `_inside`.
 """
 from __future__ import annotations
 
+import contextlib
 import html
+import io
 import json
 import logging
+import posixpath
 import re
 import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from ._inside import deck_figures, is_deck, pdftex_figures
 from .provenance import _MARKERS, is_summary
 
 # The stored fields that have a `Record` attribute of their own.
@@ -28,6 +33,7 @@ _STATUS = {
     "unreadable": "not a PDF backstamp can read",
     "missing": "no such file",
 }
+_DECK = "a deck: read_all or backstamp show reads the figures inside"
 
 # A value cut to fit the record.
 _CUT = re.compile(r"<cut, [\d,]+ characters>")
@@ -49,10 +55,13 @@ def _versions() -> dict:
 
 @dataclass(repr=False)
 class Record:
-    """A figure's provenance record, as `read` returns it.
+    """A figure's provenance record, as `read` and `read_all` return it.
 
     - ``status``: ``"ok"``, ``"unstamped"`` (a PDF without a backstamp record),
       ``"unreadable"`` (not a PDF pypdf can open) or ``"missing"``.
+    - ``where``: for a figure inside a deck or a pdfLaTeX PDF, its ``slide`` or ``page`` and
+      the ``file`` it was stored or included as; else ``None``. ``slide`` is ``None`` when
+      the deck's slide order cannot be read, or the figure is on no slide.
     - A field the record does not hold is ``None``. ``commit`` is the bare hash; ``dirty``
       says the code had uncommitted changes, and ``diff_sha`` identifies those to tracked
       files. Untracked files alone leave it ``None``.
@@ -65,6 +74,7 @@ class Record:
 
     path: str
     status: str
+    where: dict | None = None
     title: str | None = None
     creator: str | None = None
     schema: int | None = None
@@ -85,10 +95,11 @@ class Record:
         return asdict(self)
 
     def __repr__(self) -> str:
-        return f"<Record {self.status} {self.path}>"
+        return f"<Record {self.status} {self._heading()}>"
 
     def __str__(self) -> str:
-        lines = [self.path] + [f"  {label:<9} {text}".rstrip() for label, text in self._rows()]
+        lines = [self._heading()]
+        lines += [f"  {label:<9} {text}".rstrip() for label, text in self._rows()]
         if self._shortened():
             lines.append("  (long values shortened; to_dict() and --json hold them in full)")
         return "\n".join(lines)
@@ -98,12 +109,23 @@ class Record:
             f"<tr><th style='text-align:left;padding-right:1em'>{html.escape(label)}</th>"
             f"<td style='text-align:left'><code>{html.escape(text)}</code></td></tr>"
             for label, text in self._rows())
-        return f"<div><b>{html.escape(self.path)}</b><table>{cells}</table></div>"
+        return f"<div><b>{html.escape(self._heading())}</b><table>{cells}</table></div>"
+
+    def _heading(self) -> str:
+        """The path; for a figure inside a file, then its slide or page and stored name."""
+        w = self.where or {}
+        parts = [self.path] + [f"{key} {w[key]}" for key in ("slide", "page")
+                               if w.get(key) is not None]
+        if w.get("file"):
+            parts.append(w["file"])
+        return "  ".join(parts)
 
     def _rows(self) -> list:
         """``(label, text)`` rows for `__str__` and `_repr_html_`."""
         if self.status != "ok":
-            rows = [("status", f"{self.status}: {_STATUS.get(self.status, '')}"),
+            deck = self.status == "unreadable" and not self.where and is_deck(self.path)
+            status = _DECK if deck else _STATUS.get(self.status, "")
+            rows = [("status", f"{self.status}: {status}"),
                     ("title", self.title), ("creator", self.creator)]
             return [(label, text) for label, text in rows if text]
         c = self.call
@@ -144,11 +166,11 @@ class Record:
           changes, no repo or commit, a script run directly, placeholders and cut values.
         """
         if self.status != "ok":
-            return f"# {self.path}: {self.status}, no record to reproduce from"
+            return f"# {self._heading()}: {self.status}, no record to reproduce from"
         notes: list = []
         shell = self._checkout(notes)
         python = self._repeat(notes)
-        lines = [f"# {self.path}"]
+        lines = [f"# {self._heading()}"]
         if notes:
             lines += ["# Not an exact rebuild:"] + [f"# - {note}" for note in notes]
         lines += [""] + shell
@@ -272,35 +294,107 @@ def read(path) -> Record:
     """The provenance record of the figure at ``path``; never raises.
 
     - ``status`` says whether it has one: see `Record`.
+    - One `Record` per file: a deck is ``unreadable``, and a PDF compiled with pdfLaTeX is
+      ``unstamped``. `read_all` reads the figures inside them.
     """
     text = str(path)
     try:
         file = Path(path)
         if not file.exists():
             return Record(text, "missing")
-        info = _info(file)
+        if is_deck(file):
+            return Record(text, "unreadable")
+        with _quiet():
+            info = _info(_reader(file).metadata)
     except Exception:
         return Record(text, "unreadable")
+    return _record(text, info)
+
+
+def read_all(path) -> list:
+    """One `Record` per figure in the file at ``path``; never raises.
+
+    - A figure saved as a PDF gives one, as `read` does.
+    - A Keynote or PowerPoint deck gives one per figure on each slide it is on; a PDF
+      compiled with pdfLaTeX, one per included PDF on each page it is on. ``where`` names
+      the slide or page, and the file the figure was stored or included as.
+    - A deck without figures gives none.
+    """
+    return _read_all(path)[0]
+
+
+def _read_all(path) -> tuple:
+    """``(records, ordered)``: ``ordered`` is False for a deck whose slide order is unread."""
+    text = str(path)
     try:
-        return _record(text, info)
+        file = Path(path)
+        if not file.exists():
+            return [Record(text, "missing")], True
+        if is_deck(file):
+            return _deck(text, file)
+        with _quiet():
+            reader = _reader(file)
+            own = _record(text, _info(reader.metadata))
+            try:
+                inside = pdftex_figures(reader)
+            except Exception:
+                inside = []
     except Exception:
-        return Record(text, "unstamped", title=info.get("Title"), creator=info.get("Creator"))
+        return [Record(text, "unreadable")], True
+    figures = [_record(text, _info(info), {"page": page, "file": _included_as(name)})
+               for page, name, info in inside]
+    return ([own] if own.status == "ok" or not figures else []) + figures, True
 
 
-def _info(path: Path) -> dict:
-    """``Title``, ``Subject`` and ``Creator`` of a PDF; raises when pypdf cannot read it."""
-    from pypdf import PdfReader
+def _deck(text: str, file: Path) -> tuple:
+    figures, ordered = deck_figures(file)
+    infos: dict = {}
+    records = []
+    for slide, member, data in figures:
+        if member not in infos:
+            try:
+                with _quiet():
+                    infos[member] = _info(_reader(data).metadata)
+            except Exception:
+                infos[member] = None
+        where = {"slide": slide, "file": posixpath.basename(member)}
+        info = infos[member]
+        records.append(Record(text, "unreadable", where) if info is None
+                       else _record(text, info, where))
+    return records, ordered
 
+
+def _included_as(name) -> str | None:
+    """``/PTEX.FileName`` as text, without a leading ``./``."""
+    text = _text(name)
+    return text[2:] if text and text.startswith("./") else text
+
+
+@contextlib.contextmanager
+def _quiet():
+    """pypdf's log lines and warnings silenced: a junk file is ``unreadable``, quietly."""
     logger = logging.getLogger("pypdf")
     level = logger.level
     logger.setLevel(logging.CRITICAL + 1)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            meta = PdfReader(str(path)).metadata or {}
-            return {key: _text(meta.get(f"/{key}")) for key in ("Title", "Subject", "Creator")}
+            yield
     finally:
         logger.setLevel(level)
+
+
+def _reader(source):
+    """A pypdf reader of a path or of bytes."""
+    from pypdf import PdfReader
+
+    return PdfReader(io.BytesIO(source) if isinstance(source, bytes) else str(source))
+
+
+def _info(meta) -> dict:
+    """``Title``, ``Subject`` and ``Creator`` of a PDF info dictionary, which may be ``None``."""
+    meta = meta or {}
+    return {key: _text(meta.get(f"/{key}")) for key in ("Title", "Subject", "Creator")}
 
 
 def _text(value) -> str | None:
@@ -312,8 +406,17 @@ def _text(value) -> str | None:
     return str(value) if isinstance(value, str) else None
 
 
-def _record(path: str, info: dict) -> Record:
-    rec = Record(path, "unstamped", title=info.get("Title"), creator=info.get("Creator"))
+def _record(path: str, info: dict, where: dict | None = None) -> Record:
+    """The `Record` held in an info dictionary's ``Subject``; ``unstamped`` if none."""
+    try:
+        return _parse(path, info, where)
+    except Exception:
+        return Record(path, "unstamped", where, title=info.get("Title"),
+                      creator=info.get("Creator"))
+
+
+def _parse(path: str, info: dict, where: dict | None) -> Record:
+    rec = Record(path, "unstamped", where, title=info.get("Title"), creator=info.get("Creator"))
     try:
         stored = json.loads(info.get("Subject") or "")
     except ValueError:
@@ -350,4 +453,4 @@ def _record(path: str, info: dict) -> Record:
     return rec
 
 
-__all__ = ["read", "Record"]
+__all__ = ["read", "read_all", "Record"]

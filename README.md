@@ -4,7 +4,8 @@ A saved figure says nothing about the code that made it. Weeks later, finding th
 the function, the parameters and the data behind a plot means searching old scripts, or
 making it again.
 
-backstamp writes that record into the figure file when it is saved, and reads it back.
+backstamp writes that record into the figure file when it is saved, and reads it back:
+from the figure, or from the slide decks and LaTeX papers it ends up in.
 
 ## Install
 
@@ -155,6 +156,30 @@ figures/accuracy.pdf
 - `--json` prints every field. `--reproduce` prints the commands that rebuild the figure.
 - `python -m backstamp` runs the same command.
 
+### Figures in decks and papers
+
+A figure dragged into a Keynote or PowerPoint deck keeps its record inside the deck, and
+one included in a LaTeX document keeps it inside the PDF that pdfLaTeX compiles.
+`backstamp show` reads every figure in the deck or PDF, by slide or page:
+
+```
+$ backstamp show talk.key --slide 3
+talk.key  slide 3  accuracy-9092.pdf
+  title     accuracy sub-40,45 20251124-20260203
+  inputs    subject = [40, 45]
+            date    = ["20251124", "20260203"]
+  made by   lab.plots:plot_accuracy  (plots.py:212)
+  ...
+```
+
+- `--slide N` and `--page N` keep the figures on that slide or page. Both can be repeated.
+- After the slide or page comes the name the figure was stored or included as. Keynote
+  adds a number to the file name; PowerPoint stores each figure as `imageN.emf`.
+- A figure on several slides is listed on each.
+- Decks: `.key`, as a file or a package folder, and `.pptx`.
+- If the slide order of a deck cannot be read, its figures are listed without slide
+  numbers, and `show` says so.
+
 ### Find figures
 
 `backstamp ls` lists the figures in a folder and its subfolders, one row each:
@@ -168,7 +193,14 @@ sub-40/latency  plot_latency   a1b2c3d        sub-40 20251124-20251130     2026-
 $ backstamp ls figures/ --dirty --subject 40
 name      function       commit         inputs                       created
 accuracy  plot_accuracy  a1b2c3d-dirty  sub-40,45 20251124-20260203  2026-10-05
+
+$ backstamp ls talks/ --function plot_accuracy
+name                                   function       commit         inputs                       created
+lab-meeting.key slide 3 accuracy-9092  plot_accuracy  a1b2c3d-dirty  sub-40,45 20251124-20260203  2026-10-05
 ```
+
+A figure inside a deck or a pdfLaTeX PDF gets a row of its own, named by the file, the
+slide or page, and the name the figure was stored as. The filters apply to it.
 
 | Filter | Keeps figures |
 | --- | --- |
@@ -227,15 +259,23 @@ rec.inputs              # {"subject": [40, 45], "date": ["20251124", "20260203"]
 print(rec)              # the block backstamp show prints
 print(rec.reproduce())
 rec.to_dict()           # every field, as JSON-safe data
+
+for rec in backstamp.read_all("talks/lab-meeting.key"):
+    rec.where           # {"slide": 3, "file": "accuracy-9092.pdf"}
 ```
 
-`read` never raises. `rec.status` says what it found:
+`read` reads a file as one figure. `read_all` returns a list with one `Record` per figure:
+one for a figure's own PDF, and one for each figure on each slide or page of a deck or a
+pdfLaTeX PDF. `where` names the `slide` or `page`, and the `file` the figure was stored or
+included as; it is `None` for a figure's own PDF.
+
+Neither raises. `rec.status` says what was found:
 
 | `status` | The file is |
 | --- | --- |
 | `"ok"` | a figure with a record |
-| `"unstamped"` | a PDF without a record, such as one another program saved |
-| `"unreadable"` | not a PDF |
+| `"unstamped"` | a PDF without a record, such as one another program saved, or a pdfLaTeX PDF read with `read` |
+| `"unreadable"` | not a PDF, or a deck read with `read` |
 | `"missing"` | not there |
 
 - `commit` is the hash alone. `dirty` says the code had uncommitted changes, and
@@ -246,6 +286,38 @@ rec.to_dict()           # every field, as JSON-safe data
 - `cut` names the values cut to fit the size limit, such as `params.trials`.
 - `extra` holds any field passed in `save(provenance=...)` without an attribute of its own.
 - In Jupyter, a record displays as a table.
+
+## What the record survives
+
+The record is part of the PDF file, so it goes wherever the file goes. It is lost when a
+program draws the figure into a new PDF.
+
+| Route | Record |
+| --- | --- |
+| Copy or move the file: Finder, `cp`, `mv` | kept |
+| Upload to Dropbox, OneDrive or Google Drive, download again | kept |
+| Commit to git, clone | kept |
+| Send through Slack, or as an email attachment | kept |
+| Open in Preview; annotate and save | kept |
+| Open in Acrobat, save | kept |
+| Open in Illustrator, save as PDF | kept; the `Title` becomes the file name |
+| Open in Inkscape, save as PDF | lost |
+| Drag into a Keynote or PowerPoint deck, save | kept inside the deck |
+| Copy and paste from one deck into another | kept inside the new deck |
+| Copy from PowerPoint, paste into Preview (New from Clipboard) | kept |
+| Copy from Keynote, paste into Preview | lost |
+| Export a deck as PDF | lost |
+| Print to PDF | lost |
+| Include in a LaTeX document, compile with pdfLaTeX (e.g. on Overleaf) | kept inside the compiled PDF |
+
+- `backstamp show` reads the records inside decks and pdfLaTeX PDFs: see
+  [Figures in decks and papers](#figures-in-decks-and-papers).
+- Dropbox and OneDrive download several files at once as a zip. Unzip it to read them.
+- Acrobat's Document Properties shows only the first 2,000 characters of a long record.
+  The file holds all of it.
+- Tested on macOS with Keynote 15, PowerPoint for Mac 16, Acrobat, Illustrator 30.8,
+  Inkscape 1.4.3 and pdfTeX 1.40.29, using records of up to 30,000 characters and
+  non-ASCII text. Untested: PowerPoint for Windows, LuaLaTeX and XeLaTeX.
 
 ## Wrapping `save`
 

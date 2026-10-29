@@ -196,9 +196,10 @@ def test_to_dict_is_json_and_holds_every_field():
     with tempfile.TemporaryDirectory() as tmp:
         rec = read(_stamped(tmp, "x", provenance(), inputs={"subject": [1]}))
     data = json.loads(json.dumps(rec.to_dict()))
-    assert list(data) == ["path", "status", "title", "creator", "schema", "created", "commit",
-                          "dirty", "diff_sha", "branch", "repo", "call", "inputs", "versions",
-                          "cut", "extra"]
+    assert list(data) == ["path", "status", "where", "title", "creator", "schema", "created",
+                          "commit", "dirty", "diff_sha", "branch", "repo", "call", "inputs",
+                          "versions", "cut", "extra"]
+    assert data["where"] is None
     assert data["call"]["function"] == "test_to_dict_is_json_and_holds_every_field"
     assert data["inputs"] == {"subject": [1]} and data["status"] == "ok"
     assert list(Record("p", "missing").to_dict()["call"]) == [
