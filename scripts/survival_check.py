@@ -32,7 +32,6 @@ import tempfile
 import time
 import warnings
 import zipfile
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,13 +41,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 import backstamp  # noqa: E402
 from backstamp._pdf import MAX_BLOB  # noqa: E402
+from backstamp._strip import contains  # noqa: E402
 
 FIELDS = ("Title", "Subject", "Creator")
 
 # What download folders and Finder append to a copy's name.
 _COPY = re.compile(r"( \(\d+\)| copy( \d+)?| \d+)$")
-
-_STREAM = re.compile(rb"stream\r?\n(.*?)endstream", re.S)
 
 
 # --- the test set ---------------------------------------------------------
@@ -151,19 +149,6 @@ def _record(path) -> dict:
     record = backstamp.read(path).to_dict()
     del record["path"]
     return record
-
-
-def contains(data: bytes, text: str) -> bool:
-    """Whether ``data``, or a Flate stream in it, holds ``text`` as a PDF string would."""
-    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    forms = [t.encode(codec) for t in {text, escaped} for codec in ("utf-8", "utf-16-be")]
-    blobs = [data]
-    for match in _STREAM.finditer(data):
-        try:
-            blobs.append(zlib.decompressobj().decompress(match.group(1)))
-        except zlib.error:
-            pass
-    return any(form in blob for blob in blobs for form in forms)
 
 
 def _members(path: Path) -> list:

@@ -5,7 +5,8 @@ the function, the parameters and the data behind a plot means searching old scri
 making it again.
 
 backstamp writes that record into the figure file when it is saved, and reads it back:
-from the figure, or from the slide decks and LaTeX papers it ends up in.
+from the figure, or from the slide decks and LaTeX papers it ends up in. Before you
+publish, it writes a copy without the record.
 
 ## Install
 
@@ -318,6 +319,42 @@ program draws the figure into a new PDF.
 - Tested on macOS with Keynote 15, PowerPoint for Mac 16, Acrobat, Illustrator 30.8,
   Inkscape 1.4.3 and pdfTeX 1.40.29, using records of up to 30,000 characters and
   non-ASCII text. Untested: PowerPoint for Windows, LuaLaTeX and XeLaTeX.
+
+## Strip the record before publishing
+
+The record holds your repository, parameters and inputs. That helps you and the people
+you work with, but a figure sent to a journal, or a paper posted as a preprint, need not
+carry it. `backstamp strip` writes a copy without it:
+
+```
+$ backstamp strip figures/accuracy.pdf
+figures/accuracy.pdf -> figures/accuracy_stripped.pdf  removed: Subject, Title, Creator
+```
+
+- The copy sits next to the file, with `_stripped` added to its name. A copy already there
+  is replaced; the original is never changed.
+- It removes the record, with backstamp's `Title` and `Creator` beside it, wherever it is:
+  in the PDF's own fields; in the XMP metadata, where Acrobat and Illustrator copy it; and
+  inside each figure of a paper compiled with pdfLaTeX. A `Title` or `Creator` another
+  program wrote stays, as does the rest of the PDF: a paper's own title, its pages, links
+  and outline.
+- It then checks the copy. If any record text is left anywhere in the file, compressed
+  parts included, it writes no copy and says where the text is.
+- A PDF without a record gets no copy, and `strip` says so.
+- It takes folders and globs, as `show` does. With no path, it waits for PDFs dropped
+  into the terminal.
+
+Decks are not stripped. `strip` names the figures in a deck that hold a record:
+
+```
+$ backstamp strip talk.key
+backstamp: talk.key: a deck; backstamp strips PDFs, not decks. These figures in it hold a record:
+  accuracy-9092.pdf  slides 3, 4  accuracy sub-40,45 20251124-20260203
+Strip each figure before adding it to the deck, or share the deck exported as PDF, which holds no records.
+```
+
+In Python, `backstamp.strip("figures/accuracy.pdf")` returns the copy's path, and `out=`
+names it. When it writes no copy, it raises a `ValueError` with the same message.
 
 ## Wrapping `save`
 

@@ -11,7 +11,7 @@ license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 authors = [{ name = "Joschua Geuter" }]
 requires-python = ">=3.9"
-dependencies = ["matplotlib", "pypdf>=3"]
+dependencies = ["matplotlib", "pypdf>=3.15"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: Matplotlib",

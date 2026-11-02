@@ -1,8 +1,10 @@
-"""The ``backstamp`` command: ``show`` prints figures' records, ``ls`` lists a folder.
+"""The ``backstamp`` command: ``show`` prints figures' records, ``ls`` lists a folder,
+``strip`` writes copies without the records.
 
-- ``backstamp show`` with no path reads paths from the terminal, one line at a time, so
-  figures can be dropped into the window.
-- Both read the figures inside decks and pdfLaTeX PDFs, one record each, by slide or page.
+- ``backstamp show`` and ``backstamp strip`` with no path read paths from the terminal, one
+  line at a time, so figures can be dropped into the window.
+- ``show`` and ``ls`` read the figures inside decks and pdfLaTeX PDFs, one record each, by
+  slide or page.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from urllib.parse import unquote, urlparse
 from ._inside import is_deck
 from ._pdf import _DATE, _NEXT, range_ends, summarize_inputs
 from ._read import _read_all
+from ._strip import NoRecord, strip_copy
 
 _GLOB = re.compile(r"[*?[]")
 _INT = re.compile(r"[0-9]+")
@@ -29,8 +32,9 @@ _COLUMNS = (("name", 48), ("function", 28), ("commit", 13), ("inputs", 36), ("cr
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="backstamp", description="Read the record backstamp stores in a figure.")
-    commands = parser.add_subparsers(dest="command", metavar="{show,ls}")
+        prog="backstamp", description="Read, list or strip the record backstamp stores in a "
+                                      "figure.")
+    commands = parser.add_subparsers(dest="command", metavar="{show,ls,strip}")
 
     show = commands.add_parser(
         "show", help="print each figure's record",
@@ -63,6 +67,13 @@ def main(argv=None) -> int:
     ls.add_argument("--commit", metavar="SHA", help="made at SHA; a prefix is enough")
     ls.add_argument("--unstamped", action="store_true", help="only figures without a record")
 
+    strip = commands.add_parser(
+        "strip", help="write a copy of each PDF without its record",
+        description="Write a copy of each PDF without its record, for publishing: fig.pdf "
+                    "-> fig_stripped.pdf, next to it. The original is not changed. Decks are "
+                    "not stripped. With no path, drop PDFs into the terminal one at a time.")
+    strip.add_argument("paths", nargs="*", help="PDFs, folders or globs")
+
     args = parser.parse_args(argv)
     if args.command == "ls" and any("=" not in item for item in args.input):
         parser.error("--input takes KEY=VALUE")
@@ -73,9 +84,11 @@ def main(argv=None) -> int:
             pass
     try:
         if args.command == "show":
-            return _show(args) if args.paths else _drop(args)
+            return _show(args) if args.paths else _drop(args, _show)
         if args.command == "ls":
             return _ls(args)
+        if args.command == "strip":
+            return _strip(args) if args.paths else _drop(args, _strip)
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 130
@@ -113,8 +126,9 @@ def _show(args, paths=None) -> int:
     return 1 if any(r.status in ("missing", "unreadable") for r in records) else 0
 
 
-def _drop(args) -> int:
-    """Read figure paths from the terminal until an empty line or end of input."""
+def _drop(args, run) -> int:
+    """Read figure paths from the terminal until an empty line or end of input; ``run``
+    takes ``(args, paths)``."""
     quit_key = "Ctrl-Z, Enter" if os.name == "nt" else "Ctrl-D"
     print(f"Drop a figure here or paste its path, then Enter ({quit_key} to quit):",
           file=sys.stderr)
@@ -125,7 +139,7 @@ def _drop(args) -> int:
         if not paths:
             print(file=sys.stderr)
             return 0
-        _show(args, paths)
+        run(args, paths)
         print()
 
 
@@ -200,6 +214,30 @@ def _read_file(path: Path) -> list:
         print(f"backstamp: {path}: could not read the slide order; its figures are listed "
               f"without slide numbers", file=sys.stderr)
     return records
+
+
+# --- strip ----------------------------------------------------------------
+
+
+def _strip(args, paths=None) -> int:
+    """Strip the PDFs in ``paths``, or in ``args.paths``; 1 if any could not be stripped."""
+    paths = args.paths if paths is None else paths
+    files = _figures(paths)
+    if not files:
+        print(f"backstamp: no PDFs or decks in {' '.join(paths)}", file=sys.stderr)
+        return 1
+    failed = False
+    for file in files:
+        try:
+            copy, removed = strip_copy(file)
+        except NoRecord as exc:
+            print(exc)
+        except (OSError, ValueError) as exc:
+            print(f"backstamp: {exc}", file=sys.stderr)
+            failed = True
+        else:
+            print(f"{file} -> {copy}  removed: {', '.join(place for place, _ in removed)}")
+    return 1 if failed else 0
 
 
 # --- ls -------------------------------------------------------------------
