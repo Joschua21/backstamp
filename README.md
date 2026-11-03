@@ -33,6 +33,52 @@ describes the function that calls it.
 `save` takes a figure, an axes (what pandas' `.plot` returns) or a seaborn grid (what
 `relplot` and `catplot` return).
 
+### In your own save code
+
+Already saving your figures? `backstamp.metadata()` returns the record as a `metadata=`
+dict. Any of these, inside the plotting function:
+
+```python
+def plot_accuracy(subjids, dates, window=50):
+    ...
+    meta = backstamp.metadata(inputs={"subject": subjids, "date": dates})
+    fig.savefig("figures/accuracy.pdf", metadata=meta)        # matplotlib
+    plt.savefig("figures/accuracy.pdf", metadata=meta)        # pyplot
+    ax.figure.savefig("figures/accuracy.pdf", metadata=meta)  # pandas: .plot returns ax
+    g.savefig("figures/accuracy.pdf", metadata=meta)          # seaborn: relplot, catplot
+    with PdfPages("figures/all.pdf", metadata=meta) as pdf:   # many pages, one record
+        ...
+```
+
+- Call it inside the plotting function, as with `save`: the record describes the function
+  that calls `metadata()`. Its first argument heads the `Title`; it defaults to the
+  function's name.
+- PDF only: a PNG, SVG or JPEG save raises an error when given it.
+
+A save helper of your own takes the dict from the plotting function:
+
+```python
+def save_fig(fig, name, metadata=None):
+    fig.savefig(f"figures/{name}.pdf", metadata=metadata)
+    fig.savefig(f"figures/{name}.png")
+
+def plot_accuracy(subjids, dates, window=50):
+    ...
+    save_fig(fig, "accuracy", metadata=backstamp.metadata(inputs={"subject": subjids, "date": dates}))
+```
+
+Or, kept in a module of its own, it calls `metadata()` itself and skips that module:
+
+```python
+# mylab/saving.py
+def save_fig(fig, name, inputs=None):
+    meta = backstamp.metadata(inputs=inputs, skip_modules=(__name__,))
+    fig.savefig(f"figures/{name}.pdf", metadata=meta)
+```
+
+`skip_modules` skips the whole module, so this only works when the plotting functions live
+elsewhere.
+
 ## What the record holds
 
 - the commit of the repository the calling code lives in, marked `-dirty` when it has
@@ -40,7 +86,8 @@ describes the function that calls it.
   branch, and the `origin` URL without credentials
 - the installed version of the calling package, the Python version and the backstamp
   version
-- the function that called `save`: its module, file, line, and the functions enclosing it
+- the function that called `save` or `metadata`: its module, file, line, and the functions
+  enclosing it
 - every parameter of that function, in full. Data objects are stored as their type and
   shape (`<DataFrame 50x2>`, `<ndarray (3, 4) float64>`), not their values.
 - the inputs, as given (below)
@@ -50,8 +97,8 @@ The record identifies the data when the plotting function takes IDs (subjects, d
 file names) and loads the data itself. A function handed a DataFrame records only its
 shape.
 
-Parameters are recorded with the values they have when `save` runs. A parameter
-reassigned inside the function is recorded with its new value.
+Parameters are recorded with the values they have when `save` or `metadata` runs. A
+parameter reassigned inside the function is recorded with its new value.
 
 The record is JSON in the PDF's `Subject` field, with a one-line summary in `Title`, e.g.
 `accuracy sub-40,45 20251124-20260203`.
@@ -76,22 +123,6 @@ inputs=["subjids", "dates"]                         # copy these parameters from
 - A parameter name the function does not have gives a warning.
 - `subject`, `date` and `session` are summarised in the `Title` as `sub-40,45`, the date
   span, and `ses-1,2`. Any other key shows as `key=value`.
-
-## Your own `savefig`
-
-`backstamp.metadata()` returns the record as a `metadata=` dict, for a save you make
-yourself:
-
-```python
-def plot_accuracy(subjids, dates):
-    ...
-    fig.savefig("figures/accuracy.pdf", metadata=backstamp.metadata(inputs=["subjids", "dates"]))
-    with PdfPages("figures/all.pdf", metadata=backstamp.metadata("all")) as pdf:
-        ...
-```
-
-Call it inside the plotting function, as with `save`. The first argument heads the
-`Title`; it defaults to the function's name.
 
 ## Paths and private data
 
