@@ -14,7 +14,7 @@ from ._save import save
 from ._strip import strip
 from .provenance import configure
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = ["save", "metadata", "configure", "read", "read_all", "Record", "strip",
            "__version__"]
