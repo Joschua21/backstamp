@@ -184,6 +184,9 @@ figures/accuracy.pdf
 - With no path, `backstamp show` waits for one: drop a figure into the terminal window, or
   paste its path, and press Enter. Several files dropped at once are read together. An
   empty line or Ctrl-D quits.
+- Flags typed before or after a dropped figure apply to that line: `figure.pdf --reproduce`,
+  `--slide 2 deck.key`. Flags given to `backstamp show` itself apply to every figure
+  dropped.
 - It also takes folders, searched with their subfolders, and globs.
 - `--json` prints every field. `--reproduce` prints the commands that rebuild the figure.
 - `python -m backstamp` runs the same command.

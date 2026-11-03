@@ -281,6 +281,17 @@ def test_show_keeps_the_slides_and_pages_asked_for():
         assert f"# {paper}  page 1  b.pdf: unstamped, no record to reproduce from" in out
 
 
+def test_slides_typed_with_a_dropped_deck_replace_the_commands():
+    deck = FIXTURES / "keynote-slides.key"
+    stdin, sys.stdin = sys.stdin, io.StringIO(f"'{deck}'\n'{deck}' --slide 3\n\n")
+    try:
+        code, out, _ = _run("show", "--slide", "1")
+    finally:
+        sys.stdin = stdin
+    assert code == 0 and _headings(out) == [f"{deck}  slide 1  nonascii-9091.pdf",
+                                            f"{deck}  slide 3  small-9092.pdf"], out
+
+
 def test_ls_lists_the_figures_inside_as_rows():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

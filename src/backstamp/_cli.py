@@ -2,7 +2,8 @@
 ``strip`` writes copies without the records.
 
 - ``backstamp show`` and ``backstamp strip`` with no path read paths from the terminal, one
-  line at a time, so figures can be dropped into the window.
+  line at a time, so figures can be dropped into the window. A line dropped into ``show``
+  may carry its flags too.
 - ``show`` and ``ls`` read the figures inside decks and pdfLaTeX PDFs, one record each, by
   slide or page.
 """
@@ -40,16 +41,11 @@ def main(argv=None) -> int:
         "show", help="print each figure's record",
         description="Print each figure's record; a deck or a PDF compiled with pdfLaTeX "
                     "gives every figure inside, by slide or page. With no path, drop "
-                    "figures into the terminal one at a time.")
+                    "figures into the terminal one at a time; flags typed before or after "
+                    "a dropped figure apply to that line.")
     show.add_argument("paths", nargs="*", help="figures, decks, folders or globs")
-    show.add_argument("--slide", metavar="N", type=int, action="append", default=[],
-                      help="only the figures on slide N of a deck")
-    show.add_argument("--page", metavar="N", type=int, action="append", default=[],
-                      help="only the figures on page N of a PDF compiled with pdfLaTeX")
-    mode = show.add_mutually_exclusive_group()
-    mode.add_argument("--json", action="store_true", help="every field, as JSON")
-    mode.add_argument("--reproduce", action="store_true",
-                      help="the commands that rebuild the figure")
+    _show_flags(show)
+    show.set_defaults(slide=[], page=[])
 
     ls = commands.add_parser(
         "ls", help="list the figures in a folder",
@@ -84,7 +80,7 @@ def main(argv=None) -> int:
             pass
     try:
         if args.command == "show":
-            return _show(args) if args.paths else _drop(args, _show)
+            return _show(args) if args.paths else _drop(args, _show, _show_flags)
         if args.command == "ls":
             return _ls(args)
         if args.command == "strip":
@@ -97,6 +93,18 @@ def main(argv=None) -> int:
 
 
 # --- show -----------------------------------------------------------------
+
+
+def _show_flags(parser) -> None:
+    """The flags ``show`` takes, on its command line and on each line dropped into it."""
+    parser.add_argument("--slide", metavar="N", type=int, action="append",
+                        help="only the figures on slide N of a deck")
+    parser.add_argument("--page", metavar="N", type=int, action="append",
+                        help="only the figures on page N of a PDF compiled with pdfLaTeX")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--json", action="store_true", help="every field, as JSON")
+    mode.add_argument("--reproduce", action="store_true",
+                      help="the commands that rebuild the figure")
 
 
 def _show(args, paths=None) -> int:
@@ -126,25 +134,54 @@ def _show(args, paths=None) -> int:
     return 1 if any(r.status in ("missing", "unreadable") for r in records) else 0
 
 
-def _drop(args, run) -> int:
+class _LineParser(argparse.ArgumentParser):
+    """The flags typed on a dropped line: a mistake is reported, and the prompt goes on."""
+
+    def error(self, message):
+        raise ValueError(message)
+
+
+def _drop(args, run, flags=None) -> int:
     """Read figure paths from the terminal until an empty line or end of input; ``run``
-    takes ``(args, paths)``."""
+    takes ``(args, paths)``.
+
+    - ``flags`` adds the flags a line may carry, before or after its paths. They apply to
+      that line, in place of the same flags on the command.
+    """
+    parser = _LineParser(prog="backstamp", add_help=False, argument_default=argparse.SUPPRESS)
+    parser.add_argument("paths", nargs="*", default=[])
+    if flags is not None:
+        flags(parser)
     quit_key = "Ctrl-Z, Enter" if os.name == "nt" else "Ctrl-D"
     print(f"Drop a figure here or paste its path, then Enter ({quit_key} to quit):",
           file=sys.stderr)
     while True:
         print("> ", end="", file=sys.stderr, flush=True)
-        line = sys.stdin.readline()
-        paths = clean_paths(line)
-        if not paths:
+        words = clean_paths(sys.stdin.readline())
+        if not words:
             print(file=sys.stderr)
             return 0
-        run(args, paths)
+        try:
+            given = vars(parser.parse_intermixed_args(words))
+        except ValueError as exc:
+            print(f"backstamp: {exc}", file=sys.stderr)
+            continue
+        paths = given.pop("paths")
+        # An unquoted path with spaces, pasted with a flag.
+        if (len(paths) > 1 and not all(os.path.exists(p) for p in paths)
+                and os.path.exists(" ".join(paths))):
+            paths = [" ".join(paths)]
+        if not paths:
+            print("backstamp: no figure on that line", file=sys.stderr)
+            continue
+        if "json" in given or "reproduce" in given:
+            given = {"json": False, "reproduce": False, **given}
+        run(argparse.Namespace(**{**vars(args), **given}), paths)
         print()
 
 
 def clean_paths(line: str) -> list:
-    """The paths in one dropped or pasted line.
+    """The paths in one dropped or pasted line, and any flags typed with them.
 
     - Undoes what terminals add: backslash-escaped spaces (Terminal, iTerm), single quotes
       (VS Code), double quotes (Windows Terminal), ``file://`` URLs, a trailing space.

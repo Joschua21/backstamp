@@ -333,6 +333,33 @@ def test_show_reads_dropped_paths_until_an_empty_line():
     assert "pypdf" not in done.stderr and "Traceback" not in done.stderr
 
 
+def test_flags_typed_with_a_dropped_figure_apply_to_that_line():
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp) / "my figures"
+        folder.mkdir()
+        fig, ax = plt.subplots()
+        a = save(fig, "accuracy", fig_dir=folder)
+        plt.close(fig)
+        lines = [f"'{a}' --reproduce",   # after the path
+                 f"--json '{a}'",        # before it
+                 f"{a} --reproduce",     # unquoted, with its space
+                 f"'{a}'",               # no flags: the command's
+                 f"'{a}' --slides 2",    # a mistake
+                 "--reproduce", ""]
+        done = _command("show", stdin="\n".join(lines) + "\n")
+        on_json = _command("show", "--json", stdin=f"'{a}' --reproduce\n'{a}'\n\n")
+    out = done.stdout
+    first, second = out.index(f"# {a}\n"), out.rindex(f"# {a}\n")
+    assert out.count(f"# {a}\n") == 2 and out.count('"status": "ok"') == 1, out
+    assert first < out.index('"status": "ok"') < second < out.index("made by"), out
+    assert out.count("made by") == 1, out
+    assert "backstamp: unrecognized arguments: --slides" in done.stderr  # 3.9 adds " 2"
+    assert "backstamp: no figure on that line\n" in done.stderr
+    assert done.returncode == 0 and "Traceback" not in done.stderr, done.stderr
+    assert on_json.stdout.startswith(f"# {a}\n"), on_json.stdout
+    assert on_json.stdout.count('"status": "ok"') == 1, on_json.stdout
+
+
 def test_show_takes_files_folders_and_globs():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
