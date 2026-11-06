@@ -33,6 +33,9 @@ MAX_CHAIN = 4
 # backstamp's own frames, never the answer to "who made this".
 _SKIP_MODULES = ("backstamp.provenance", "backstamp._pdf", "backstamp._save")
 
+# The code objects of the functions marked with `helper`.
+_HELPERS: set = set()
+
 _GIT_TIMEOUT = 5
 
 PATHS = ("name", "full", "hide")
@@ -317,15 +320,31 @@ def is_summary(value) -> bool:
 # --- the calling frame ----------------------------------------------------
 
 
+def helper(func):
+    """Mark ``func`` as a save helper: a record made inside it names the function that
+    called it, with that function's parameters. Returns ``func`` unchanged.
+
+    - Skips ``func`` alone, where ``skip_modules`` skips its whole module.
+    - Takes functions, closures, methods, ``staticmethod`` and ``classmethod``. Under other
+      decorators it marks the function itself, never a wrapper the decorator shares.
+    """
+    code = getattr(inspect.unwrap(getattr(func, "__func__", func)), "__code__", None)
+    if code is None:
+        raise TypeError(f"backstamp.helper marks a function, not {type(func).__name__}")
+    _HELPERS.add(code)
+    return func
+
+
 def capture_call(*, skip_modules=()) -> dict | None:
-    """The nearest frame outside backstamp and ``skip_modules``: the call that made the output.
+    """The nearest frame outside backstamp, ``skip_modules`` and the functions marked with
+    `helper`: the call that made the output.
 
     Returns ``function``, ``module``, ``file``, ``lineno``, ``chain``, ``args`` and ``path``.
 
-    - ``chain``: up to `MAX_CHAIN` function names, nearest first. ``function`` is often a
-      local ``_save_fig`` closure; ``chain`` keeps the analysis around it. It ends at the
-      first ``<module>``: the frames above a script's, cell's or module's top level are
-      whatever ran it, such as IPython.
+    - ``chain``: up to `MAX_CHAIN` function names, nearest first, with the same frames
+      skipped. ``function`` may be an unmarked local ``_save_fig`` closure; ``chain`` keeps
+      the analysis around it. It ends at the first ``<module>``: the frames above a
+      script's, cell's or module's top level are whatever ran it, such as IPython.
     - ``args``: every parameter's current value, unconverted.
     - ``path``: the file's full path, the git anchor. The record does not store it.
     """
@@ -338,6 +357,7 @@ def capture_call(*, skip_modules=()) -> dict | None:
         kept = [
             entry for entry in stack[1:]
             if (entry.frame.f_globals.get("__name__", "") not in skip)
+            and entry.frame.f_code not in _HELPERS
             and not entry.frame.f_globals.get("__name__", "").startswith(
                 ("importlib", "runpy"))
         ]
@@ -456,7 +476,8 @@ def provenance(*, anchor=None, call: dict | None = None, inputs=None, paths=None
 
 
 __all__ = [
-    "provenance", "configure", "capture_call", "git_commit", "git_info", "package_version",
+    "provenance", "configure", "helper", "capture_call", "git_commit", "git_info",
+    "package_version",
     "record_value", "resolve_inputs", "inputs_record", "check_inputs", "is_summary",
     "SCHEMA", "MAX_CHAIN", "PATHS",
 ]

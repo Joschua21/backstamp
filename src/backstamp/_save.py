@@ -25,7 +25,7 @@ def save(fig, name: str, *, fig_dir, filename=None, inputs=None, paths=None, red
     - ``redact``: parameter names stored as ``<redacted>``, added to `configure`'s.
     - ``provenance``: a record to embed in place of capturing one.
     - ``skip_modules``: modules the frame walk passes over. A function wrapping `save`
-      passes its own, or the record names the wrapper.
+      is marked with `helper`, or passes its own module, or the record names the wrapper.
     - ``metadata``: extra PDF info-dictionary entries; keys outside the PDF standard set
       are dropped.
     """

@@ -55,29 +55,24 @@ def plot_accuracy(subjids, dates, window=50):
   function's name.
 - PDF only: a PNG, SVG or JPEG save raises an error when given it.
 
-A save helper of your own takes the dict from the plotting function:
+A save helper of your own that calls `metadata()` is marked with `@backstamp.helper`. The
+record then names the function that called the helper, with that function's parameters:
 
 ```python
-def save_fig(fig, name, metadata=None):
-    fig.savefig(f"figures/{name}.pdf", metadata=metadata)
+@backstamp.helper
+def save_fig(fig, name, inputs=None):
+    meta = backstamp.metadata(name, inputs=inputs)
+    fig.savefig(f"figures/{name}.pdf", metadata=meta)
     fig.savefig(f"figures/{name}.png")
 
 def plot_accuracy(subjids, dates, window=50):
     ...
-    save_fig(fig, "accuracy", metadata=backstamp.metadata(inputs={"subject": subjids, "date": dates}))
+    save_fig(fig, "accuracy", inputs={"subject": subjids, "date": dates})
 ```
 
-Or, kept in a module of its own, it calls `metadata()` itself and skips that module:
-
-```python
-# mylab/saving.py
-def save_fig(fig, name, inputs=None):
-    meta = backstamp.metadata(inputs=inputs, skip_modules=(__name__,))
-    fig.savefig(f"figures/{name}.pdf", metadata=meta)
-```
-
-`skip_modules` skips the whole module, so this only works when the plotting functions live
-elsewhere.
+- The helper can sit anywhere, in the same file as the plotting functions too.
+- Mark each function between the plotting function and backstamp: a helper that calls
+  another helper of yours marks both.
 
 ## What the record holds
 
@@ -86,8 +81,8 @@ elsewhere.
   branch, and the `origin` URL without credentials
 - the installed version of the calling package, the Python version and the backstamp
   version
-- the function that called `save` or `metadata`: its module, file, line, and the functions
-  enclosing it
+- the function that called `save` or `metadata`, directly or through a marked helper: its
+  module, file, line, and the functions enclosing it
 - every parameter of that function, in full. Data objects are stored as their type and
   shape (`<DataFrame 50x2>`, `<ndarray (3, 4) float64>`), not their values.
 - the inputs, as given (below)
@@ -393,12 +388,17 @@ names it. When it writes no copy, it raises a `ValueError` with the same message
 ## Wrapping `save`
 
 The record names the nearest calling function outside backstamp. A function that wraps
-`save` passes its own module, so the record names the plotting function instead of the
-wrapper:
+`save` is marked with `@backstamp.helper`, as above, so the record names the plotting
+function instead of the wrapper:
 
 ```python
-backstamp.save(fig, name, fig_dir=out_dir, skip_modules=(__name__,))
+@backstamp.helper
+def save_figure(fig, name):
+    return backstamp.save(fig, name, fig_dir="figures/")
 ```
+
+`skip_modules=(__name__,)` on the call to `save` or `metadata` skips every function in the
+wrapper's module instead, for a module that holds only wrappers.
 
 ## Licence
 

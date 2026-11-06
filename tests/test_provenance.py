@@ -737,6 +737,125 @@ def test_chain_survives_the_pdf_round_trip():
         assert got.call["chain"][:2] == ["_save_fig", "analysis"]
 
 
+# --- marked helpers -------------------------------------------------------
+
+
+@backstamp.helper
+def _save_beside_the_plotter(fig, name, out):
+    return save(fig, name, fig_dir=out), backstamp.metadata(name)
+
+
+def plot_initiation_rate(out, subjids, separate_odors=False):
+    fig, ax = plt.subplots()
+    path, meta = _save_beside_the_plotter(fig, "rate", out)
+    plt.close(fig)
+    return path, json.loads(meta["Subject"])
+
+
+def test_a_marked_helper_beside_the_plotter_names_the_plotter():
+    """Same module, so ``skip_modules`` would skip the plotter too."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path, record = plot_initiation_rate(tmp, [66], separate_odors=True)
+        saved = read(path).call
+    for call in (saved, record):
+        assert call["function"] == "plot_initiation_rate"
+        assert call["chain"][:2] == ["plot_initiation_rate",
+                                     "test_a_marked_helper_beside_the_plotter_names_the_plotter"]
+        assert list(call["params"]) == ["out", "subjids", "separate_odors"]
+        assert call["params"]["subjids"] == [66] and call["params"]["separate_odors"] is True
+
+
+def test_marked_closures_and_stacked_helpers_are_passed_over():
+    import types
+
+    wrapper_mod = types.ModuleType("fake_repo.io.save")
+    wrapper_mod.provenance = provenance
+    exec("def save_figure():\n    return provenance(skip_modules=(__name__,))\n",
+         wrapper_mod.__dict__)
+
+    @backstamp.helper
+    def _outer_save():
+        return _inner_save()
+
+    @backstamp.helper
+    def _inner_save():
+        return wrapper_mod.save_figure()
+
+    def plot_speed(window):
+        @backstamp.helper
+        def _save_fig():
+            return _outer_save()
+        return _save_fig()
+
+    for window in (3, 5):  # the closure is marked again on each call
+        record = plot_speed(window)
+        assert record["function"] == "plot_speed" and record["params"] == {"window": window}
+        assert record["chain"][:2] == ["plot_speed",
+                                       "test_marked_closures_and_stacked_helpers_are_passed_over"]
+
+
+def test_a_marked_helper_called_from_the_top_level_names_the_script():
+    namespace = {"__name__": "__main__", "provenance": provenance, "helper": backstamp.helper}
+    exec("@helper\ndef save_fig():\n    return provenance()\nrecord = save_fig()\n", namespace)
+    assert namespace["record"]["function"] == "<module>"
+    assert namespace["record"]["chain"] == ["<module>"]
+
+
+def test_helper_takes_methods_and_marks_the_function_under_other_decorators():
+    import functools
+    from backstamp.provenance import _HELPERS
+
+    class Saver:
+        @backstamp.helper
+        @staticmethod
+        def static():
+            return provenance()
+
+        @backstamp.helper
+        @classmethod
+        def classwide(cls):
+            return provenance()
+
+        @backstamp.helper
+        def method(self):
+            return provenance()
+
+    @backstamp.helper
+    @functools.lru_cache(maxsize=None)
+    def _cached_above():
+        return provenance()
+
+    @functools.lru_cache(maxsize=None)
+    @backstamp.helper
+    def _cached_below():
+        return provenance()
+
+    def plot_all():
+        return [Saver.static(), Saver.classwide(), Saver().method(), _cached_above(),
+                _cached_below()]
+
+    assert [r["function"] for r in plot_all()] == ["plot_all"] * 5
+
+    def logged(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+
+    def _save():
+        return provenance()
+
+    marked = backstamp.helper(logged(_save))
+    assert _save.__code__ in _HELPERS and marked.__code__ not in _HELPERS
+    for wrong in (functools.partial(print), Saver):
+        try:
+            backstamp.helper(wrong)
+        except TypeError as exc:
+            assert "marks a function" in str(exc)
+        else:
+            raise AssertionError(f"helper took {wrong!r}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = []
